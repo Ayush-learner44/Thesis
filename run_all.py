@@ -12,15 +12,17 @@ Check logs after:
 
 import time
 
-BASE = '/home/ayush/my'
+BASE = '/home/ayush/my2'
 
-hosts_scripts = [
-    ('h1', 'attack.py'),
-    ('h2', 'attack.py'),
-    ('h3', 'traffic.py'),
-    ('h4', 'traffic.py'),
-    ('h5', 'traffic.py'),
-]
+# 20 attackers + 40 legit, spread across BOTH splitters:
+#   s1 side:  h1..h10 attack     |  h11..h30 legit  (10 atk + 20 legit)
+#   s2 side:  h31..h40 attack    |  h41..h60 legit  (10 atk + 20 legit)
+hosts_scripts = (
+    [(f'h{i}', 'attack.py')  for i in range(1, 11)]   +  # h1..h10  attack on s1
+    [(f'h{i}', 'attack.py')  for i in range(31, 41)]  +  # h31..h40 attack on s2
+    [(f'h{i}', 'traffic.py') for i in range(11, 31)]  +  # h11..h30 legit on s1
+    [(f'h{i}', 'traffic.py') for i in range(41, 61)]     # h41..h60 legit on s2
+)
 
 for host, script in hosts_scripts:
     net.get(host).cmd(f'cd {BASE} && python3 {script} > /tmp/my_{host}.log 2>&1 &')

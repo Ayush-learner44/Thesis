@@ -156,7 +156,7 @@ control MyIngress(inout headers_t hdr,
     table l2_forward {
         key     = { hdr.ethernet.dstAddr: exact; }
         actions = { forward; drop; NoAction; }
-        size    = 64;
+        size    = 128;
         default_action = NoAction();
     }
 
@@ -220,9 +220,11 @@ control MyIngress(inout headers_t hdr,
                     cms_min = c1;
                 }
 
-                // Step 7: fire THRESHOLD digest every 64 SYNs
-                // bitmask & 0x3F == 0 iff cms_min is an exact multiple of 64
-                if ((cms_min & 32w0x3F) == 0 && cms_min > 0) {
+                // Step 7: fire THRESHOLD digest every 32 SYNs
+                // bitmask & 0x1F == 0 iff cms_min is an exact multiple of 32
+                // (lowered from 0x3F/64 to compensate for ECMP SYN-split dilution
+                //  at 60-host scale — see test.txt section 12 for the math)
+                if ((cms_min & 0x1F) == 0 && cms_min > 0) {
                     digest<threshold_digest_t>(1, {
                         hdr.ipv6.srcAddr,
                         hdr.ipv6.dstAddr,

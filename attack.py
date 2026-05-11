@@ -28,15 +28,16 @@ subprocess.run(['ip6tables', '-F', 'OUTPUT'], capture_output=True)
 subprocess.run(['ip6tables', '-A', 'OUTPUT', '-p', 'tcp',
                 '--tcp-flags', 'RST', 'RST', '-j', 'DROP'], capture_output=True)
 
-VICTIM_IP   = "2001:1:1::10"
+VICTIM_IP   = "2001:1:1::100"
 VICTIM_MAC  = "aa:00:00:00:00:00"
 DST_PORT    = 80
 TOTAL_SYNS  = 2000
 
-IPV6_MAP = {
-    'h0': '2001:1:1::10', 'h1': '2001:1:1::1', 'h2': '2001:1:1::2',
-    'h3': '2001:1:1::3',  'h4': '2001:1:1::4', 'h5': '2001:1:1::5',
-}
+# h0 + 60 client hosts. Used as fallback when p4-utils' setIntfIp didn't
+# successfully land an IPv6 on the interface — common in WSL2 because
+# new netns inherit net.ipv6.conf.default.disable_ipv6=1.
+IPV6_MAP = {'h0': '2001:1:1::100'}
+IPV6_MAP.update({f'h{i}': f'2001:1:1::{i:x}' for i in range(1, 61)})
 
 
 def get_iface_info():

@@ -1,66 +1,63 @@
 #!/usr/bin/env python3
 """
-verify.py — Post-experiment DDoS detection metrics calculator.
+verify.py — Post-experiment DDoS detection metrics (3-path version).
 
-BEFORE the experiment, start tcpdump on h0:
-    (in h0 xterm)  tcpdump -i h0-eth0 -w /home/ayush/my/capture.pcap &
+Reads up to 3 pcaps captured by server.py (paths A, B, C) and produces:
+  1. Per-path traffic breakdown (SYN / SYN-ACK / handshake counts)
+  2. IP breakdown aggregated across all 3 paths
+  3. Confusion matrix and accuracy/precision/recall/F1 metrics
 
-After experiment, stop it:
-    kill %1   (or killall tcpdump)
-
-Then run this script:
-    python3 /home/ayush/my/verify.py
-    python3 /home/ayush/my/verify.py /path/to/other.pcap
+Usage:
+    python3 /home/ayush/my2/verify.py
+    python3 /home/ayush/my2/verify.py /path/to/path_a.pcap /path/to/path_b.pcap /path/to/path_c.pcap
 """
 
 from scapy.all import rdpcap, IPv6, TCP
 import sys, os
 
-IP_TO_HOST = {
-    '2001:1:1::1':  'h1',
-    '2001:1:1::2':  'h2',
-    '2001:1:1::3':  'h3',
-    '2001:1:1::4':  'h4',
-    '2001:1:1::5':  'h5',
-    '2001:1:1::10': 'h0 (server)',
-}
+# IP → host name mapping (extends to 60 clients)
+IP_TO_HOST = {f'2001:1:1::{i:x}': f'h{i}' for i in range(1, 61)}
+IP_TO_HOST['2001:1:1::100'] = 'h0 (server)'
 
-SERVER_IP = '2001:1:1::10'
+SERVER_IP = '2001:1:1::100'
 
-ALL_CLIENT_IPS = {
-    '2001:1:1::1', '2001:1:1::2', '2001:1:1::3',
-    '2001:1:1::4', '2001:1:1::5',
-}
+# All 60 client hosts. h1..h30 live on s1, h31..h60 on s2.
+ALL_CLIENT_IPS = {f'2001:1:1::{i:x}' for i in range(1, 61)}
 
-# Each scenario defines: attacker_ips, legit_ips, total_attack, total_legit
+# run_all.py split: 20 attackers (h1..h10 + h31..h40), 40 legit (h11..h30 + h41..h60)
+_RUNALL_ATK_IDS = list(range(1, 11)) + list(range(31, 41))
+_RUNALL_LEG_IDS = list(range(11, 31)) + list(range(41, 61))
+RUNALL_ATTACKERS = {f'2001:1:1::{i:x}' for i in _RUNALL_ATK_IDS}
+RUNALL_LEGIT     = {f'2001:1:1::{i:x}' for i in _RUNALL_LEG_IDS}
+
 SCENARIOS = {
     '1': {
-        'name':          'run_all.py  —  h1,h2 attack  |  h3,h4,h5 legit',
-        'attacker_ips':  {'2001:1:1::1', '2001:1:1::2'},
-        'legit_ips':     {'2001:1:1::3', '2001:1:1::4', '2001:1:1::5'},
-        'total_attack':  4000,  # 2000 SYNs × 2 attacker hosts
-        'total_legit':   240,   # 80 conns × 3 legit hosts
+        'name':          'run_all.py  —  20 attackers (h1-h10, h31-h40)  |  40 legit (h11-h30, h41-h60)',
+        'attacker_ips':  RUNALL_ATTACKERS,
+        'legit_ips':     RUNALL_LEGIT,
+        'total_attack':  40000,    # 20 attackers × 2000 SYNs each
+        'total_legit':   3200,     # 40 legit    × 80 conns  each
     },
     '2': {
-        'name':          'attacks.py  —  h1–h5 all attack',
+        'name':          'attacks.py  —  all 60 hosts (h1-h60) attack',
         'attacker_ips':  ALL_CLIENT_IPS.copy(),
         'legit_ips':     set(),
-        'total_attack':  10000, # 2000 SYNs × 5 hosts
+        'total_attack':  120000,   # 60 × 2000
         'total_legit':   0,
     },
     '3': {
-        'name':          'flooding.py  —  h1–h5 all flash crowd (legit)',
+        'name':          'flooding.py  —  all 60 hosts flash crowd (legit burst)',
         'attacker_ips':  set(),
         'legit_ips':     ALL_CLIENT_IPS.copy(),
         'total_attack':  0,
-        'total_legit':   1000,  # 200 conns × 5 hosts
+        'total_legit':   12000,    # 60 × 200 conns
     },
     '4': {
-        'name':          'legit-traffic.py  —  h1–h5 all legit traffic',
+        'name':          'legit-traffic.py  —  all 60 hosts slow legit traffic',
         'attacker_ips':  set(),
         'legit_ips':     ALL_CLIENT_IPS.copy(),
         'total_attack':  0,
-        'total_legit':   400,   # 80 conns × 5 hosts
+        'total_legit':   4800,     # 60 × 80 conns
     },
     '5': {
         'name':          'Single attack.py from h1 only',
@@ -74,7 +71,7 @@ SCENARIOS = {
 
 def pick_scenario():
     print("\n" + "=" * 60)
-    print("  verify.py — DDoS Detection Metrics")
+    print("  verify.py — DDoS Detection Metrics (3-path topology)")
     print("=" * 60)
     print("\nWhich script did you run?\n")
     for k, v in SCENARIOS.items():
@@ -99,8 +96,8 @@ def pick_scenario():
         raw = input("  Legit IPs: ").strip()
         legit_ips = {ip.strip() for ip in raw.split(',') if ip.strip()}
 
-        total_attack = int(input("  Total attack SYNs sent (e.g. 200): ").strip())
-        total_legit  = int(input("  Total legit conns sent (e.g. 180): ").strip())
+        total_attack = int(input("  Total attack SYNs sent: ").strip())
+        total_legit  = int(input("  Total legit conns sent: ").strip())
 
     else:
         print("Invalid choice. Exiting.")
@@ -110,18 +107,17 @@ def pick_scenario():
 
 
 def count_flags(pkts):
-    """Count SYNs, SYN-ACKs, and completed handshakes (3rd-ACK) in a pcap.
+    """Count SYNs / SYN-ACKs / completed handshakes (3rd ACK) in a pcap.
 
     ACKs are counted by unique (src_ip, src_port) pairs — one entry per
     TCP connection regardless of how many ACK packets it sends.
-    Server-originated ACKs (sport=80) are excluded; we only count
-    client-to-server handshake completions.
+    Server-originated ACKs (sport=80) are excluded.
     """
     TCP_SYN = 0x002
     TCP_ACK = 0x010
     syns = 0; synacks = 0
     per_ip_syn = {}
-    ack_connections = set()   # (src_ip, src_port) — one per unique connection
+    ack_connections = set()
 
     for pkt in pkts:
         if IPv6 not in pkt or TCP not in pkt:
@@ -136,7 +132,7 @@ def count_flags(pkts):
         elif is_syn and is_ack:
             synacks += 1
         elif is_ack and not is_syn:
-            if src != SERVER_IP:          # skip server's outgoing ACKs
+            if src != SERVER_IP:
                 ack_connections.add((src, pkt[TCP].sport))
 
     acks = len(ack_connections)
@@ -147,17 +143,17 @@ def count_flags(pkts):
     return syns, synacks, acks, per_ip_syn, per_ip_ack
 
 
-def print_path_comparison(path_a_pkts, path_b_pkts):
+def print_path_breakdown(path_pkts):
+    """path_pkts: dict of label → packet list (one entry per active path)."""
     print("\n" + "=" * 60)
     print("PER-PATH TRAFFIC BREAKDOWN")
     print("=" * 60)
-    for label, pkts in [("PATH_A  (eth0 — detector switch / SYN path)", path_a_pkts),
-                         ("PATH_B  (eth1 — passthrough / ACK path)",     path_b_pkts)]:
+    for label, pkts in path_pkts.items():
         syns, synacks, acks, per_ip_syn, per_ip_ack = count_flags(pkts)
-        print(f"\n  {label}")
-        print(f"    Pure SYNs        : {syns:6d}")
-        print(f"    SYN-ACKs         : {synacks:6d}")
-        print(f"    Completed handshakes (3rd ACK, client-only): {acks:6d}")
+        print(f"\n  {label}  ({len(pkts)} packets)")
+        print(f"    Pure SYNs                          : {syns:6d}")
+        print(f"    SYN-ACKs                           : {synacks:6d}")
+        print(f"    Completed handshakes (client ACK)  : {acks:6d}")
         if per_ip_syn:
             print(f"    SYNs by IP  :", end='')
             for ip, n in sorted(per_ip_syn.items()):
@@ -173,22 +169,16 @@ def print_path_comparison(path_a_pkts, path_b_pkts):
 
 
 def count_syns(pkts, attacker_ips, legit_ips):
-    """Count pure SYN (SYN=1, ACK=0) packets reaching h0 from each group."""
     TCP_SYN = 0x002
     TCP_ACK = 0x010
-
-    attack_reached   = 0
-    legit_reached    = 0
-    attack_per_ip    = {}
-    legit_per_ip     = {}
-
+    attack_reached, legit_reached = 0, 0
+    attack_per_ip, legit_per_ip   = {}, {}
     for pkt in pkts:
         if IPv6 not in pkt or TCP not in pkt:
             continue
         flags = int(pkt[TCP].flags)
         if not ((flags & TCP_SYN) and not (flags & TCP_ACK)):
-            continue                    # skip SYN-ACKs, ACKs, data, FIN etc.
-
+            continue
         src = pkt[IPv6].src
         if src in attacker_ips:
             attack_reached += 1
@@ -196,17 +186,33 @@ def count_syns(pkts, attacker_ips, legit_ips):
         elif src in legit_ips:
             legit_reached += 1
             legit_per_ip[src] = legit_per_ip.get(src, 0) + 1
-
     return attack_reached, legit_reached, attack_per_ip, legit_per_ip
+
+
+def count_syns_all_paths(path_pkts, attacker_ips, legit_ips):
+    """Aggregate SYN counts across all pcaps. A SYN reaching h0 on ANY
+    path counts as 'reached' — each connection only hashes to one path,
+    so there's no double-counting risk."""
+    a_total, l_total = 0, 0
+    a_ip, l_ip = {}, {}
+    for pkts in path_pkts.values():
+        a, l, ai, li = count_syns(pkts, attacker_ips, legit_ips)
+        a_total += a
+        l_total += l
+        for ip, n in ai.items():
+            a_ip[ip] = a_ip.get(ip, 0) + n
+        for ip, n in li.items():
+            l_ip[ip] = l_ip.get(ip, 0) + n
+    return a_total, l_total, a_ip, l_ip
 
 
 def print_results(attack_reached, legit_reached, attack_per_ip, legit_per_ip,
                   attacker_ips, legit_ips, total_attack, total_legit):
 
-    FN = attack_reached                  # attack SYNs that slipped through to h0
-    TN = legit_reached                   # legit SYNs that correctly reached h0
-    TP = max(0, total_attack - FN)       # attack SYNs blocked by the switch
-    FP = max(0, total_legit  - TN)       # legit SYNs incorrectly blocked
+    FN = attack_reached
+    TN = legit_reached
+    TP = max(0, total_attack - FN)
+    FP = max(0, total_legit  - TN)
 
     total     = TP + TN + FP + FN
     accuracy  = (TP + TN) / total                         if total            > 0 else 0
@@ -214,9 +220,8 @@ def print_results(attack_reached, legit_reached, attack_per_ip, legit_per_ip,
     recall    = TP / (TP + FN)                            if (TP + FN)        > 0 else 0
     f1        = 2*precision*recall / (precision + recall) if (precision+recall)> 0 else 0
 
-    # ── IP breakdown ──────────────────────────────────────────────────────────
     print("\n" + "=" * 60)
-    print("IP BREAKDOWN")
+    print("IP BREAKDOWN  (aggregated across all 3 paths)")
     print("=" * 60)
 
     per_attacker = (total_attack // len(attacker_ips)) if attacker_ips else 0
@@ -239,19 +244,23 @@ def print_results(attack_reached, legit_reached, attack_per_ip, legit_per_ip,
     else:
         print("    none")
 
-    # ── Confusion matrix ──────────────────────────────────────────────────────
+    # Per-class percentages (TP/FN against total attack, TN/FP against total legit)
+    tp_pct = (TP / total_attack * 100) if total_attack > 0 else 0.0
+    fn_pct = (FN / total_attack * 100) if total_attack > 0 else 0.0
+    tn_pct = (TN / total_legit  * 100) if total_legit  > 0 else 0.0
+    fp_pct = (FP / total_legit  * 100) if total_legit  > 0 else 0.0
+
     print("\n" + "=" * 60)
     print("CONFUSION MATRIX")
     print("=" * 60)
-    print(f"  TP  attack SYNs blocked          : {TP:6d}   (total_attack_sent - FN)")
-    print(f"  FN  attack SYNs reached h0       : {FN:6d}   (slipped through)")
-    print(f"  TN  legit SYNs reached h0        : {TN:6d}   (correctly passed)")
-    print(f"  FP  legit SYNs blocked           : {FP:6d}   (total_legit_sent - TN)")
+    print(f"  TP  attack SYNs blocked          : {TP:6d}  ({tp_pct:6.2f}%  of attack)")
+    print(f"  FN  attack SYNs reached h0       : {FN:6d}  ({fn_pct:6.2f}%  of attack)")
+    print(f"  TN  legit SYNs reached h0        : {TN:6d}  ({tn_pct:6.2f}%  of legit )")
+    print(f"  FP  legit SYNs blocked           : {FP:6d}  ({fp_pct:6.2f}%  of legit )")
     print(f"  ---")
     print(f"  total_attack_sent                : {total_attack:6d}")
     print(f"  total_legit_sent                 : {total_legit:6d}")
 
-    # ── Metrics ───────────────────────────────────────────────────────────────
     print("\n" + "=" * 60)
     print("METRICS")
     print("=" * 60)
@@ -263,8 +272,9 @@ def print_results(attack_reached, legit_reached, attack_per_ip, legit_per_ip,
 
 
 def main():
-    pcap_a = sys.argv[1] if len(sys.argv) > 1 else '/home/ayush/my/capture_path_a.pcap'
-    pcap_b = sys.argv[2] if len(sys.argv) > 2 else '/home/ayush/my/capture_path_b.pcap'
+    pcap_a = sys.argv[1] if len(sys.argv) > 1 else '/home/ayush/my2/capture_path_a.pcap'
+    pcap_b = sys.argv[2] if len(sys.argv) > 2 else '/home/ayush/my2/capture_path_b.pcap'
+    pcap_c = sys.argv[3] if len(sys.argv) > 3 else '/home/ayush/my2/capture_path_c.pcap'
 
     if not os.path.exists(pcap_a):
         print(f"\nERROR: pcap not found: {pcap_a}")
@@ -273,24 +283,32 @@ def main():
 
     attacker_ips, legit_ips, total_attack, total_legit = pick_scenario()
 
+    path_pkts = {}
     print(f"\nReading {pcap_a} ...")
-    pkts_a = rdpcap(pcap_a)
-    print(f"  {len(pkts_a)} packets on path_a (eth0)")
+    pa = rdpcap(pcap_a)
+    path_pkts['PATH_A  (eth0 — detector A)'] = pa
+    print(f"  {len(pa)} packets")
 
-    pkts_b = []
     if os.path.exists(pcap_b):
         print(f"Reading {pcap_b} ...")
-        pkts_b = rdpcap(pcap_b)
-        print(f"  {len(pkts_b)} packets on path_b (eth1)")
+        pb = rdpcap(pcap_b)
+        path_pkts['PATH_B  (eth1 — detector B)'] = pb
+        print(f"  {len(pb)} packets")
     else:
-        print(f"  (path_b pcap not found — skipping path comparison)")
+        print(f"  (path_b pcap not found — skipping)")
 
-    # Per-path breakdown — the asymmetric routing proof
-    print_path_comparison(pkts_a, pkts_b)
+    if os.path.exists(pcap_c):
+        print(f"Reading {pcap_c} ...")
+        pc = rdpcap(pcap_c)
+        path_pkts['PATH_C  (eth2 — detector C)'] = pc
+        print(f"  {len(pc)} packets")
+    else:
+        print(f"  (path_c pcap not found — skipping)")
 
-    # Metrics use path_a (SYNs that slipped through to h0 on the detector path)
+    print_path_breakdown(path_pkts)
+
     attack_reached, legit_reached, attack_per_ip, legit_per_ip = \
-        count_syns(pkts_a, attacker_ips, legit_ips)
+        count_syns_all_paths(path_pkts, attacker_ips, legit_ips)
 
     print_results(attack_reached, legit_reached, attack_per_ip, legit_per_ip,
                   attacker_ips, legit_ips, total_attack, total_legit)

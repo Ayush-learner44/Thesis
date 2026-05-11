@@ -8,8 +8,9 @@ Each host fires traffic.py (real TCP connections) simultaneously.
 Expected result: all connections succeed, nobody gets blocked.
 """
 
-SCRIPT = '/home/ayush/my/traffic.py'
-HOSTS  = ['h1', 'h2', 'h3', 'h4', 'h5']
+SCRIPT = '/home/ayush/my2/traffic.py'
+# All 60 hosts — h1..h30 on s1, h31..h60 on s2
+HOSTS  = [f'h{i}' for i in range(1, 61)]
 
 print(f"[legit-traffic] Launching traffic.py on {HOSTS} simultaneously...")
 

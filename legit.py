@@ -39,17 +39,18 @@ subprocess.run(['ip6tables', '-A', 'OUTPUT', '-p', 'tcp',
                 '--tcp-flags', 'RST', 'RST', '-j', 'DROP'], capture_output=True)
 
 # ── Config ─────────────────────────────────────────────────────────────────
-VICTIM_IP   = "2001:1:1::10"
+VICTIM_IP   = "2001:1:1::100"
 VICTIM_MAC  = "aa:00:00:00:00:00"
 DST_PORT    = 80
 SRC_PORT    = 20000    # FIXED — all packets hit the same CMS bucket
 NUM_PACKETS = 80       # 64 triggers THRESHOLD; 80 gives second trigger at 128
 RATE_PPS    = 8        # 8 pps → at 64 pkts: elapsed≈8s, pps≈8 → ML = BENIGN
 
-IPV6_MAP = {
-    'h0': '2001:1:1::10', 'h1': '2001:1:1::1', 'h2': '2001:1:1::2',
-    'h3': '2001:1:1::3',  'h4': '2001:1:1::4', 'h5': '2001:1:1::5',
-}
+# h0 + 60 client hosts. Used as fallback when p4-utils' setIntfIp didn't
+# successfully land an IPv6 on the interface — common in WSL2 because
+# new netns inherit net.ipv6.conf.default.disable_ipv6=1.
+IPV6_MAP = {'h0': '2001:1:1::100'}
+IPV6_MAP.update({f'h{i}': f'2001:1:1::{i:x}' for i in range(1, 61)})
 
 # ── Interface / IP detection ───────────────────────────────────────────────
 def get_iface_info():

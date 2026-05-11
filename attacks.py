@@ -8,8 +8,9 @@ Each host fires attack.py (200 raw SYNs at 100 pps) simultaneously.
 Controller should detect each host independently and block all of them.
 """
 
-SCRIPT = '/home/ayush/my/attack.py'
-HOSTS  = ['h1', 'h2', 'h3', 'h4', 'h5']
+SCRIPT = '/home/ayush/my2/attack.py'
+# All 60 hosts — h1..h30 on s1, h31..h60 on s2
+HOSTS  = [f'h{i}' for i in range(1, 61)]
 
 print(f"[attacks] Launching attack.py on {HOSTS} simultaneously...")
 

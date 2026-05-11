@@ -1,17 +1,22 @@
 """
-DDoS Detection Controller — Asymmetric 3-switch topology
+DDoS Detection Controller — Asymmetric Diamond Topology
+(2 splitters: s1, s2  ×  3 detectors: A, B, C  ×  60 hosts)
 
-Switch roles (set by the experimenter via network.py routing, NOT hardcoded here):
-  merge_sw   (traffic_splitter.p4) — splits traffic; controller installs L2 only
-  path_a_sw  (ddos_detector.p4)   — full detector: CMS, digests, block rules
-  path_b_sw  (ddos_detector.p4)   — full detector: CMS, digests, block rules
-                                     (identical capabilities to path_a_sw)
+Switch roles:
+  s1, s2     (traffic_splitter.p4)  — table-driven splitters.
+                                       Controller fills syn_split + ack_split
+                                       tables with entries that realise the
+                                       chosen scenario's routing pattern.
+  A, B, C    (ddos_detector.p4)     — identical CMS detectors.
+                                       All three run the same P4. Their
+                                       behaviour differs only because of
+                                       which traffic the splitters send.
 
-SPLITTER_SWITCHES defines which switches run the splitter P4.
-All other switches are treated as detector switches — identical treatment:
-  - All three digest types enabled
-  - Block rules pushed to all of them on detection
-  - Digest receiver thread per switch
+The active scenario is chosen at startup via an interactive prompt
+(same pattern as verify.py). The chosen scenario determines which
+entries the controller installs into the syn_split and ack_split
+tables on s1 and s2. Detection logic, ML ensemble, FlowTable, digest
+handlers — all UNCHANGED from the 2-detector version.
 """
 
 import os, sys, time, pickle, threading, logging, ipaddress
@@ -33,49 +38,129 @@ log.addHandler(_handler)
 
 _PROJECT_ROOT = os.path.join(os.path.dirname(__file__), '..')
 MODELS_DIR    = os.path.join(_PROJECT_ROOT, 'ml', 'models')
+TOPO_PATH     = os.path.join(_PROJECT_ROOT, 'topology.json')
 
 SPLITTER_P4RT = os.path.join(_PROJECT_ROOT, 'p4src', 'traffic_splitter_p4rt.txt')
 SPLITTER_JSON = os.path.join(_PROJECT_ROOT, 'p4src', 'traffic_splitter.json')
 DETECTOR_P4RT = os.path.join(_PROJECT_ROOT, 'p4src', 'ddos_detector_p4rt.txt')
 DETECTOR_JSON = os.path.join(_PROJECT_ROOT, 'p4src', 'ddos_detector.json')
 
-# Switches running the splitter P4 — no digests, no block rules pushed here
-SPLITTER_SWITCHES = {'merge_sw'}
+# Switches running the splitter P4 — no digests, no block rules pushed here.
+SPLITTER_SWITCHES = {'s1', 's2'}
 
-HOST_MACS = {
-    'h0': 'aa:00:00:00:00:00',
-    'h1': 'aa:00:00:00:00:01',
-    'h2': 'aa:00:00:00:00:02',
-    'h3': 'aa:00:00:00:00:03',
-    'h4': 'aa:00:00:00:00:04',
-    'h5': 'aa:00:00:00:00:05',
-}
+# Host MACs — h0 + 60 clients
+HOST_MACS = {'h0': 'aa:00:00:00:00:00'}
+for _i in range(1, 61):
+    HOST_MACS[f'h{_i}'] = f'aa:00:00:00:00:{_i:02x}'
 
 # ================================================================
 # PORT MAPS — must match port1= values in network.py addLink calls
 # ================================================================
 
-MERGE_PORT_MAP = {
-    'h1': 1, 'h2': 2, 'h3': 3, 'h4': 4, 'h5': 5,
-}
+# Splitters carry only their own clients' MACs in l2_forward.
+# s1: hosts h1..h30 on ports 1..30
+S1_PORT_MAP = {f'h{i}': i for i in range(1, 31)}
+# s2: hosts h31..h60 on ports 1..30 (h31→1, h60→30)
+S2_PORT_MAP = {f'h{i}': i - 30 for i in range(31, 61)}
 
-PATH_A_PORT_MAP = {
-    'h0': 2,
-    'h1': 1, 'h2': 1, 'h3': 1, 'h4': 1, 'h5': 1,
-}
+# Detector switches: s1=port 1, s2=port 2, h0=port 3.
+# L2 forwarding decides which splitter port to send return traffic
+# toward, based on which side the destination client lives on.
+_DETECTOR_PORT_MAP = {f'h{i}': 1 for i in range(1, 31)}
+_DETECTOR_PORT_MAP.update({f'h{i}': 2 for i in range(31, 61)})
+_DETECTOR_PORT_MAP['h0'] = 3
 
-PATH_B_PORT_MAP = {
-    'h0': 2,
-    'h1': 1, 'h2': 1, 'h3': 1, 'h4': 1, 'h5': 1,
-}
+A_PORT_MAP = dict(_DETECTOR_PORT_MAP)
+B_PORT_MAP = dict(_DETECTOR_PORT_MAP)
+C_PORT_MAP = dict(_DETECTOR_PORT_MAP)
 
 PORT_MAPS = {
-    'merge_sw':  MERGE_PORT_MAP,
-    'path_a_sw': PATH_A_PORT_MAP,
-    'path_b_sw': PATH_B_PORT_MAP,
+    's1': S1_PORT_MAP, 's2': S2_PORT_MAP,
+    'A':  A_PORT_MAP,  'B':  B_PORT_MAP,  'C':  C_PORT_MAP,
 }
 
 MAX_FLOW_TABLE_SIZE = 100_000
+
+# ================================================================
+# SCENARIOS — split percentages for SYN and ACK tables
+#
+# Each entry: (name, syn_ranges, ack_ranges)
+# Range item:   (bucket_lo, bucket_hi, destination_letter)
+# Buckets cover [0..99]; destination_letter in {'A','B','C'}.
+# ================================================================
+
+SCENARIOS = {
+    1:  ('Baseline — single SYN path, single ACK path',
+         [(0, 99, 'A')],
+         [(0, 99, 'B')]),
+    2:  ('SYN split across 2 detectors (A+C), all ACKs on B',
+         [(0, 49, 'A'), (50, 99, 'C')],
+         [(0, 99, 'B')]),
+    3:  ('SYN split across all 3 detectors, all ACKs on B',
+         [(0, 32, 'A'), (33, 65, 'B'), (66, 99, 'C')],
+         [(0, 99, 'B')]),
+    4:  ('All SYNs on A, ACK split across 2 detectors (B+C)',
+         [(0, 99, 'A')],
+         [(0, 49, 'B'), (50, 99, 'C')]),
+    5:  ('All SYNs on A, ACK split across all 3 detectors',
+         [(0, 99, 'A')],
+         [(0, 32, 'A'), (33, 65, 'B'), (66, 99, 'C')]),
+    6:  ('ECMP-style noise — mild spread on both SYN and ACK',
+         [(0, 79, 'A'), (80, 89, 'B'), (90, 99, 'C')],
+         [(0,  9, 'A'), (10, 89, 'B'), (90, 99, 'C')]),
+    7:  ('Cross-contamination — A and B BOTH see SYN and ACK',
+         [(0, 69, 'A'), (70, 99, 'B')],
+         [(0, 29, 'A'), (30, 99, 'B')]),
+    8:  ('Max contamination — all 3 detectors see SYN and ACK',
+         [(0, 49, 'A'), (50, 74, 'B'), (75, 99, 'C')],
+         [(0, 24, 'A'), (25, 74, 'B'), (75, 99, 'C')]),
+    9:  ('Mirror symmetry — same split for SYN and ACK (neg control)',
+         [(0, 49, 'A'), (50, 99, 'B')],
+         [(0, 49, 'A'), (50, 99, 'B')]),
+    10: ('Mid-experiment shift — SYN path changes at t=30s',
+         [(0, 99, 'A')],
+         [(0, 99, 'B')]),
+}
+
+
+def _ranges_to_pct_str(ranges):
+    """Turn [(0,49,'A'),(50,99,'C')] into '50% -> A,  50% -> C' (buckets 0..99 = %)."""
+    parts = []
+    for lo, hi, dest in ranges:
+        pct = hi - lo + 1
+        parts.append(f'{pct:3d}% -> {dest}')
+    return ',  '.join(parts)
+
+
+def pick_scenario():
+    print()
+    print('=' * 78)
+    print('  DDoS Controller — Pick split scenario')
+    print('  (each scenario installs entries on s1 and s2 split tables)')
+    print('=' * 78)
+    print()
+    for k, (name, syn_ranges, ack_ranges) in SCENARIOS.items():
+        print(f'  {k:2d}. {name}')
+        if k == 10:
+            # Special-case: scenario 10 shifts SYN at t=30s
+            print(f'        SYN: {_ranges_to_pct_str(syn_ranges)}'
+                  f'   ──► 50% -> A,  50% -> C  @ t=30s')
+        else:
+            print(f'        SYN: {_ranges_to_pct_str(syn_ranges)}')
+        print(f'        ACK: {_ranges_to_pct_str(ack_ranges)}')
+        print()
+    print('  Legend: "70% -> A" means 70 of every 100 packets of that type go to detector A.')
+    print('          A, B, C are the three detector switches running ddos_detector.p4.')
+    print()
+    while True:
+        try:
+            choice = int(input('Enter scenario [1-10]: ').strip())
+            if choice in SCENARIOS:
+                return choice
+        except (ValueError, KeyboardInterrupt, EOFError):
+            print()
+            sys.exit(1)
+        print('Invalid choice, try again.')
 
 
 def _bytes_to_ipv6(raw):
@@ -83,7 +168,7 @@ def _bytes_to_ipv6(raw):
 
 
 # ================================================================
-# ML ENSEMBLE
+# ML ENSEMBLE  (unchanged from 2-detector version)
 # ================================================================
 
 class EnsembleClassifier:
@@ -118,19 +203,16 @@ class EnsembleClassifier:
 
 
 # ================================================================
-# FLOW TABLE
-# One entry per flow. Columns: start_time, ack_count.
-# ack_count accumulates forever — mirrors what symmetric CMS did in hardware.
+# FLOW TABLE  (unchanged)
 # ================================================================
 
 class FlowTable:
     def __init__(self, max_size=MAX_FLOW_TABLE_SIZE):
-        self._table = {}   # flow_key -> [start_us, ack_count]
+        self._table = {}
         self._lock  = threading.Lock()
         self._max   = max_size
 
     def record(self, flow_key, timestamp_us):
-        """Insert new flow. Returns True if new, False if already exists."""
         with self._lock:
             if flow_key in self._table:
                 return False
@@ -160,7 +242,11 @@ class FlowTable:
 # ================================================================
 
 class DDoSController:
-    def __init__(self):
+    def __init__(self, scenario_id):
+        self.scenario_id = scenario_id
+        name, self.syn_ranges, self.ack_ranges = SCENARIOS[scenario_id]
+        self.scenario_name = name
+
         self.ensemble    = EnsembleClassifier(MODELS_DIR)
         self.flow_table  = FlowTable()
         self.switches    = {}
@@ -169,10 +255,15 @@ class DDoSController:
                             'evidence':   0, 'attacks':   0, 'benign': 0}
         self._lock       = threading.Lock()
 
-        self.topo = load_topo('topology.json')
+        self.topo = load_topo(TOPO_PATH)
         self._connect_switches()
         self._install_forwarding_rules()
+        self._install_split_rules()
         self._enable_digests()
+
+        if scenario_id == 10:
+            threading.Timer(30.0, self._scenario_10_shift).start()
+            log.info("Scenario 10: SYN split will shift to 50%A / 50%C at t=30s")
 
     # ------------------------------------------------------------------
     # SETUP
@@ -215,14 +306,80 @@ class DDoSController:
                 try:
                     api.table_add('MyIngress.l2_forward', 'MyIngress.forward',
                                   [mac], [str(port)])
-                    log.info(f"  {sw}: {host} ({mac}) -> port {port}")
                 except Exception as e:
                     if 'already exists' not in str(e).lower():
                         log.warning(f"  {sw} L2 rule failed ({host}): {e}")
 
+    def _install_split_rules(self):
+        """Install syn_split + ack_split entries on s1 and s2 per scenario."""
+        for sw_name in SPLITTER_SWITCHES:
+            api = self.switches.get(sw_name)
+            if not api:
+                log.warning(f"  {sw_name} not connected — skipping split rules")
+                continue
+            log.info(f"Installing split rules on {sw_name} (scenario {self.scenario_id})...")
+
+            # SYN split table
+            for lo, hi, dest in self.syn_ranges:
+                for b in range(lo, hi + 1):
+                    try:
+                        api.table_add('MyIngress.syn_split',
+                                      f'MyIngress.send_to_{dest}', [str(b)])
+                    except Exception as e:
+                        if 'already exists' not in str(e).lower():
+                            log.warning(f"  syn_split[{b}] on {sw_name}: {e}")
+
+            # ACK split table
+            for lo, hi, dest in self.ack_ranges:
+                for b in range(lo, hi + 1):
+                    try:
+                        api.table_add('MyIngress.ack_split',
+                                      f'MyIngress.send_to_{dest}', [str(b)])
+                    except Exception as e:
+                        if 'already exists' not in str(e).lower():
+                            log.warning(f"  ack_split[{b}] on {sw_name}: {e}")
+
+            syn_count = sum(hi - lo + 1 for lo, hi, _ in self.syn_ranges)
+            ack_count = sum(hi - lo + 1 for lo, hi, _ in self.ack_ranges)
+            log.info(f"  {sw_name}: installed {syn_count} syn_split + {ack_count} ack_split entries")
+
+    def _scenario_10_shift(self):
+        """At t=30s, shift SYN split from 100%A to 50%A / 50%C.
+        Clears current syn_split entries and reinstalls.
+        """
+        new_syn_ranges = [(0, 49, 'A'), (50, 99, 'C')]
+        log.warning("=" * 48)
+        log.warning("SCENARIO 10 SHIFT — SYN split now 50%A / 50%C")
+        log.warning("=" * 48)
+        for sw_name in SPLITTER_SWITCHES:
+            api = self.switches.get(sw_name)
+            if not api:
+                continue
+            # Try table_clear; fall back to per-entry delete
+            try:
+                api.table_clear('MyIngress.syn_split')
+            except AttributeError:
+                for b in range(100):
+                    try:
+                        api.table_delete_match('MyIngress.syn_split', [str(b)])
+                    except Exception:
+                        pass
+            except Exception as e:
+                log.warning(f"  {sw_name} table_clear: {e}")
+            # Reinstall new ranges
+            for lo, hi, dest in new_syn_ranges:
+                for b in range(lo, hi + 1):
+                    try:
+                        api.table_add('MyIngress.syn_split',
+                                      f'MyIngress.send_to_{dest}', [str(b)])
+                    except Exception as e:
+                        if 'already exists' not in str(e).lower():
+                            log.warning(f"  syn_split[{b}] shift on {sw_name}: {e}")
+            log.info(f"  {sw_name}: syn_split reconfigured")
+
     def _enable_digests(self):
         """Enable all three digest types on every detector switch.
-        Splitter switches (merge_sw) do not run detector P4 — skipped."""
+        Splitter switches (s1, s2) do not run detector P4 — skipped."""
         for sw, api in self.switches.items():
             if sw in SPLITTER_SWITCHES:
                 continue
@@ -236,8 +393,7 @@ class DDoSController:
                     log.warning(f"  {sw} digest_enable({name}): {e}")
 
     # ------------------------------------------------------------------
-    # BLOCKING — pushed to ALL detector switches so whichever path the
-    # attacker uses next, they are blocked immediately on arrival
+    # BLOCKING — pushed to ALL detector switches
     # ------------------------------------------------------------------
 
     def _push_block_rule(self, src_ip_str):
@@ -253,7 +409,7 @@ class DDoSController:
                     log.warning(f"  Block rule failed on {sw}: {e}")
 
     # ------------------------------------------------------------------
-    # DIGEST HANDLERS
+    # DIGEST HANDLERS  (unchanged from 2-detector version)
     # ------------------------------------------------------------------
 
     def _handle_first_seen(self, members, sw_name):
@@ -346,11 +502,7 @@ class DDoSController:
         log.debug(f"EVIDENCE    [{sw_name}]  {src_ip} -> :{dst_port}")
 
     # ------------------------------------------------------------------
-    # DIGEST RECEIVER — one thread per detector switch
-    # Digest type identified by member count:
-    #   4 members → evidence_digest_t
-    #   5 members → first_seen_digest_t
-    #   6 members → threshold_digest_t
+    # DIGEST RECEIVER  (unchanged)
     # ------------------------------------------------------------------
 
     def _recv_digest(self, sw_name):
@@ -388,7 +540,6 @@ class DDoSController:
     # ------------------------------------------------------------------
 
     def start(self):
-        # Start one receiver thread per detector switch (identical treatment)
         detector_switches = [sw for sw in self.switches if sw not in SPLITTER_SWITCHES]
         for sw in detector_switches:
             t = threading.Thread(target=self._recv_digest, args=(sw,), daemon=True)
@@ -396,11 +547,13 @@ class DDoSController:
 
         log.info("")
         log.info("=" * 60)
-        log.info("DDoS Detection Controller RUNNING")
-        log.info(f"  Splitter switches  : {sorted(SPLITTER_SWITCHES)}")
-        log.info(f"  Detector switches  : {sorted(detector_switches)}")
-        log.info("  All detector switches: identical capabilities")
-        log.info("  Digests : first_seen | threshold | evidence (all 3 on each)")
+        log.info(f"DDoS Detection Controller RUNNING — scenario {self.scenario_id}")
+        log.info(f"  Scenario          : {self.scenario_name}")
+        log.info(f"  Splitter switches : {sorted(SPLITTER_SWITCHES)}")
+        log.info(f"  Detector switches : {sorted(detector_switches)}")
+        log.info(f"  SYN ranges        : {self.syn_ranges}")
+        log.info(f"  ACK ranges        : {self.ack_ranges}")
+        log.info("  Digests : first_seen | threshold | evidence (all 3 on each detector)")
         log.info("  Blocking: dangerous_table pushed to ALL detector switches")
         log.info("  pps formula: max(0, cms_min - ack_count) / elapsed_total")
         log.info("=" * 60)
@@ -420,7 +573,7 @@ class DDoSController:
                 s = self.stats.copy()
                 n_blocked = len(self.blocked_ips)
             print("\n" + "=" * 60)
-            print("FINAL STATS")
+            print(f"FINAL STATS — scenario {self.scenario_id} ({self.scenario_name})")
             print(f"  FIRST_SEEN digests  : {s['first_seen']}")
             print(f"  THRESHOLD digests   : {s['threshold']}")
             print(f"  EVIDENCE digests    : {s['evidence']}")
@@ -431,5 +584,6 @@ class DDoSController:
 
 
 if __name__ == '__main__':
-    ctrl = DDoSController()
+    scenario = pick_scenario()
+    ctrl = DDoSController(scenario)
     ctrl.start()

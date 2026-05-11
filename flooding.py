@@ -7,8 +7,9 @@ Run from the Mininet CLI:
 Uses popen() so all 5 hosts start in parallel without needing threading.
 """
 
-SCRIPT = '/home/ayush/my/flood.py'
-HOSTS  = ['h1', 'h2', 'h3', 'h4', 'h5']
+SCRIPT = '/home/ayush/my2/flood.py'
+# All 60 hosts — h1..h30 on s1, h31..h60 on s2
+HOSTS  = [f'h{i}' for i in range(1, 61)]
 
 print(f"[flooding] Launching flood.py on {HOSTS} simultaneously...")
 

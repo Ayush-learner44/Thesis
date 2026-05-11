@@ -1,11 +1,17 @@
 """
-server.py — Simple IPv6 TCP server for h0
-Self-assigns h0's IPv6 if p4-utils didn't. Listens on port 80.
-Automatically starts tcpdump on h0-eth0 and saves capture.pcap to
-/home/ayush/my/ when Ctrl+C is pressed.
+server.py — IPv6 TCP server for h0 — 3-interface version (paths A, B, C)
+
+Listens on port 80. Auto-assigns h0's IPv6 to the first interface
+(eth0 = A path) only. Paths B and C use the weak-host receive model:
+same MAC on all 3 interfaces, kernel accepts packets on any of them.
+
+Starts tcpdump on the first 3 interfaces — captures go to
+  /home/ayush/my2/capture_path_a.pcap   (A path — SYNs in baseline)
+  /home/ayush/my2/capture_path_b.pcap   (B path — ACKs in baseline)
+  /home/ayush/my2/capture_path_c.pcap   (C path)
 
 Run on h0 xterm BEFORE firing any traffic:
-    python3 /home/ayush/my/server.py
+    python3 /home/ayush/my2/server.py
 """
 
 import socket, threading, re, subprocess, time
@@ -13,29 +19,22 @@ import socket, threading, re, subprocess, time
 subprocess.run(['sysctl', '-w', 'net.ipv6.conf.all.disable_ipv6=0'], capture_output=True)
 subprocess.run(['sysctl', '-w', 'net.ipv6.conf.default.disable_ipv6=0'], capture_output=True)
 
-HOST      = "::"
-PORT      = 80
-H0_IPV6   = "2001:1:1::10"
-PCAP_PATH_A = "/home/ayush/my/capture_path_a.pcap"  # eth0 — path_a_sw (SYNs)
-PCAP_PATH_B = "/home/ayush/my/capture_path_b.pcap"  # eth1 — path_b_sw (ACKs)
+HOST    = "::"
+PORT    = 80
+H0_IPV6 = "2001:1:1::100"   # avoids collision with h16's natural addr (::10 = 0x10 = 16)
 
+PCAP_PATH_A = "/home/ayush/my2/capture_path_a.pcap"
+PCAP_PATH_B = "/home/ayush/my2/capture_path_b.pcap"
+PCAP_PATH_C = "/home/ayush/my2/capture_path_c.pcap"
+
+# Static NDP entries for all 60 clients (h1..h60)
 CLIENT_NEIGHBORS = {
-    '2001:1:1::1': 'aa:00:00:00:00:01',
-    '2001:1:1::2': 'aa:00:00:00:00:02',
-    '2001:1:1::3': 'aa:00:00:00:00:03',
-    '2001:1:1::4': 'aa:00:00:00:00:04',
-    '2001:1:1::5': 'aa:00:00:00:00:05',
+    f'2001:1:1::{i:x}': f'aa:00:00:00:00:{i:02x}'
+    for i in range(1, 61)
 }
 
 stats = {'connections': 0}
 
-def get_iface():
-    result = subprocess.run(['ip', 'link'], capture_output=True, text=True)
-    for line in result.stdout.split('\n'):
-        m = re.search(r'\d+:\s+([\w-]+eth\d+)', line)
-        if m:
-            return m.group(1)
-    return None
 
 def get_all_ifaces():
     result = subprocess.run(['ip', 'link'], capture_output=True, text=True)
@@ -46,17 +45,24 @@ def get_all_ifaces():
             ifaces.append(m.group(1))
     return ifaces
 
-def setup(iface):
+
+def setup_ipv6(iface):
+    """Assign H0_IPV6 to iface if not already present."""
     result = subprocess.run(['ip', '-6', 'addr', 'show', iface], capture_output=True, text=True)
     if H0_IPV6 not in result.stdout:
         subprocess.run(['ip', '-6', 'addr', 'add', 'nodad', H0_IPV6 + '/64', 'dev', iface],
                        capture_output=True)
         print(f"[server] Assigned {H0_IPV6}/64 to {iface} (nodad)")
+
+
+def install_ndp(iface):
+    """Install permanent NDP entries for all 60 clients on iface."""
     for ip, mac in CLIENT_NEIGHBORS.items():
         subprocess.run(['ip', '-6', 'neigh', 'replace', ip,
                         'lladdr', mac, 'dev', iface, 'nud', 'permanent'],
                        capture_output=True)
-    print(f"[server] Static neighbor entries installed for all clients on {iface}")
+    print(f"[server] Static NDP installed for {len(CLIENT_NEIGHBORS)} clients on {iface}")
+
 
 def _monitor_synrecv():
     prev = 0
@@ -77,6 +83,7 @@ def _monitor_synrecv():
             pass
         time.sleep(0.3)
 
+
 def handle(conn, addr):
     stats['connections'] += 1
     n = stats['connections']
@@ -88,16 +95,23 @@ def handle(conn, addr):
     except Exception as e:
         print(f"[server] Connection #{n} error: {e}")
 
-def start():
-    iface = get_iface()
-    if iface:
-        setup(iface)
 
-    # Start tcpdump on every interface before listening so no packets are missed
-    pcap_paths = [PCAP_PATH_A, PCAP_PATH_B]
+def start():
     all_ifaces = get_all_ifaces()
+    if not all_ifaces:
+        print("[server] WARNING: no interfaces detected")
+    else:
+        # IPv6 on the first interface (A path) only — B and C use weak host
+        setup_ipv6(all_ifaces[0])
+        # NDP entries live on the interface that owns h0's IPv6 (eth0).
+        # Server responses always exit via eth0 because the destination
+        # route is via eth0.
+        install_ndp(all_ifaces[0])
+
+    # Start tcpdump on the first 3 interfaces (A, B, C paths)
+    pcap_paths = [PCAP_PATH_A, PCAP_PATH_B, PCAP_PATH_C]
     tcpdump_procs = []
-    for i, ifc in enumerate(all_ifaces[:2]):
+    for i, ifc in enumerate(all_ifaces[:3]):
         path = pcap_paths[i]
         p = subprocess.Popen(
             ['tcpdump', '-i', ifc, '-w', path],
@@ -105,10 +119,10 @@ def start():
         )
         tcpdump_procs.append((ifc, path, p))
         print(f"[server] tcpdump capturing on {ifc} -> {path}")
-    if not tcpdump_procs:
-        print("[server] WARNING: no interfaces detected — tcpdump not started")
+    if tcpdump_procs:
+        time.sleep(0.3)
     else:
-        time.sleep(0.3)   # let tcpdump open and start capturing
+        print("[server] WARNING: tcpdump not started")
 
     threading.Thread(target=_monitor_synrecv, daemon=True).start()
 
@@ -129,6 +143,7 @@ def start():
             p.terminate()
             p.wait()
             print(f"[server] Capture saved: {ifc} -> {path}")
+
 
 if __name__ == '__main__':
     start()
