@@ -12,8 +12,8 @@ Switch roles:
                                        behaviour differs only because of
                                        which traffic the splitters send.
 
-The active scenario is chosen at startup via an interactive prompt
-(same pattern as verify.py). The chosen scenario determines which
+The active scenario is chosen at startup via an interactive prompt.
+The chosen scenario determines which
 entries the controller installs into the syn_split and ack_split
 tables on s1 and s2.
 
@@ -86,6 +86,20 @@ PORT_MAPS = {
 }
 
 MAX_FLOW_TABLE_SIZE = 100_000
+
+# ================================================================
+# REPUTATION / HYSTERESIS  — don't block on ONE bad window.
+#   each flow carries a score: +REWARD on a benign window (capped at
+#   SCORE_CAP), -PENALTY on an attack window; BLOCK only when the score
+#   reaches BLOCK_SCORE (sustained attack over several windows).
+#   RTT-lagged benign flow: one bad window -> score -1, then recovers ->
+#   never reaches BLOCK_SCORE -> not blocked. Real attacker: bad every
+#   window -> crosses BLOCK_SCORE in |BLOCK_SCORE| windows -> blocked.
+# ================================================================
+SCORE_REWARD =  1     # benign window
+SCORE_PENALTY = 1     # attack window
+SCORE_CAP     = 3     # max positive credit a flow can bank
+BLOCK_SCORE   = -2    # block when score <= this
 
 # ================================================================
 # SCENARIOS — split percentages for SYN and ACK tables
@@ -178,8 +192,8 @@ def _bytes_to_ipv6(raw):
 # ================================================================
 
 class LeanModel:
-    """Loads the lean model + its feature order. Predicts on the 6 features
-    the controller computes at THRESHOLD time (no window, no 5000x hack)."""
+    """Loads the lean model + its feature order. Predicts on the 6 windowed
+    features the controller computes at each THRESHOLD (no rate-scaling hack)."""
 
     def __init__(self, models_dir):
         with open(os.path.join(models_dir, 'lean_model.pkl'), 'rb') as f:
@@ -195,7 +209,17 @@ class LeanModel:
 
 
 # ================================================================
-# FLOW TABLE  (unchanged)
+# FLOW TABLE  (windowed: counts reset every THRESHOLD evaluation)
+#
+# entry layout: [first_seen_us, ack_count, last_eval_us, last_cms_syn, score]
+#   first_seen_us : true flow age reference — IMMUTABLE, never overwritten
+#   ack_count     : EVIDENCE-reconstructed remote ACKs since the last eval
+#                   (windowed — reset to 0 at each THRESHOLD eval)
+#   last_eval_us  : window start — reset to the eval timestamp each eval
+#   last_cms_syn  : CMS snapshot at the last eval (to compute syn_delta)
+#   score         : reputation score (hysteresis) — cross-window memory that
+#                   SURVIVES the count resets; block only when it drops to
+#                   BLOCK_SCORE. See REPUTATION constants above.
 # ================================================================
 
 class FlowTable:
@@ -210,13 +234,19 @@ class FlowTable:
                 return False
             if len(self._table) >= self._max:
                 del self._table[next(iter(self._table))]
-            self._table[flow_key] = [timestamp_us, 0]
+            self._table[flow_key] = [timestamp_us, 0, timestamp_us, 0, 0]
             return True
 
-    def get_start(self, flow_key):
+    def bump_score(self, flow_key, delta, cap):
+        """Add delta to this flow's reputation score (capped at +cap on the
+        high side) and return the new score. Runs under the table lock."""
         with self._lock:
             e = self._table.get(flow_key)
-            return e[0] if e else None
+            if e is None:
+                e = [0, 0, 0, 0, 0]
+                self._table[flow_key] = e
+            e[4] = min(cap, e[4] + delta)
+            return e[4]
 
     def increment_ack(self, flow_key):
         with self._lock:
@@ -227,6 +257,28 @@ class FlowTable:
         with self._lock:
             e = self._table.get(flow_key)
             return e[1] if e else 0
+
+    def snapshot_and_reset(self, flow_key, cms_min, timestamp_us):
+        """Atomically READ this flow's window (ACKs since last eval, previous
+        CMS snapshot, window-start time) AND reset the window — in ONE locked
+        step. ACKs arriving after this call land in the fresh window and are
+        NOT lost (they count toward the next window). first_seen is never
+        modified.  Returns (first_seen_us, last_cms_syn, ack_window, window_start_us)."""
+        with self._lock:
+            e = self._table.get(flow_key)
+            if e is None:
+                # THRESHOLD without a prior FIRST_SEEN (lost digest) — synthesise
+                e = [timestamp_us, 0, timestamp_us, 0, 0]
+                self._table[flow_key] = e
+            first_seen   = e[0]
+            ack_window   = e[1]
+            window_start = e[2]
+            last_cms     = e[3]
+            # reset the window (first_seen at e[0] is left untouched)
+            e[1] = 0
+            e[2] = timestamp_us
+            e[3] = cms_min
+            return first_seen, last_cms, ack_window, window_start
 
 
 # ================================================================
@@ -243,9 +295,22 @@ class DDoSController:
         self.flow_table  = FlowTable()
         self.switches    = {}
         self.blocked_ips = set()
-        self.stats       = {'first_seen': 0, 'threshold': 0,
-                            'evidence':   0, 'attacks':   0, 'benign': 0}
+        self.stats       = {'first_seen': 0, 'threshold': 0, 'evidence':   0,
+                            'attacks':   0, 'benign': 0, 'suspicious': 0}
         self._lock       = threading.Lock()
+
+        # per-eval feature dump for diagnostics (analyze_evals.py reads this).
+        # In a benign run, any row with verdict=ATTACK is a FALSE POSITIVE.
+        self._csv_lock = threading.Lock()
+        try:
+            self._eval_csv = open('/tmp/threshold_evals.csv', 'w')
+            self._eval_csv.write('time_us,sw,src_ip,dst_port,syn_d,ack_d,unacked,'
+                                 'completion_ratio,syn_rate_pps,duration_s,verdict,'
+                                 'score,blocked\n')
+            self._eval_csv.flush()
+        except Exception as e:
+            log.warning(f"eval CSV disabled: {e}")
+            self._eval_csv = None
 
         self.topo = load_topo(TOPO_PATH)
         self._connect_switches()
@@ -476,20 +541,26 @@ class DDoSController:
         if already_blocked:
             return
 
-        start_time = self.flow_table.get_start(flow_key)
-        if start_time is None:
-            start_time = timestamp - 1_000_000
+        # ---- WINDOWED features: each THRESHOLD eval measures ONLY the window
+        # since the previous eval, via an atomic snapshot-and-reset (see TODO.md).
+        #   syn_count = new SYNs this window = CMS snapshot delta (~32 in the
+        #               asymmetric case, where cms_min is monotonic-up because
+        #               ACKs take the other path). cms_min is already net of any
+        #               LOCAL ACK decrement done in the dataplane.
+        #   ack_count = EVIDENCE-reconstructed remote ACKs THIS window (then reset)
+        # first_seen (immutable) is returned for logging but not used as the clock.
+        first_seen, last_cms, ack_window, window_start = \
+            self.flow_table.snapshot_and_reset(flow_key, cms_min, timestamp)
 
-        # ---- compute the 6 lean features at THRESHOLD time (cumulative) ----
-        #   cms_min       = SYNs seen for this flow (net of any local ACK decrement)
-        #   ack_count     = ACKs reconstructed globally from EVIDENCE digests
-        #                   (this is the asymmetric-routing reconstruction: an ACK
-        #                    that took a different path is counted here)
-        syn_count        = cms_min
-        ack_count        = self.flow_table.get_ack(flow_key)
+        syn_count = cms_min - last_cms
+        if syn_count <= 0:
+            # non-monotonic CMS (contamination, or a local-ACK decrement dipped
+            # cms_min below the last snapshot) — fall back to the raw count.
+            syn_count = cms_min
+        ack_count        = ack_window
         unacked          = max(0, syn_count - ack_count)
         completion_ratio = (ack_count / syn_count) if syn_count > 0 else 0.0
-        elapsed          = max(0.001, (timestamp - start_time) / 1_000_000.0)
+        elapsed          = max(0.001, (timestamp - window_start) / 1_000_000.0)
         syn_rate_pps     = syn_count / elapsed
         duration_s       = elapsed
 
@@ -501,14 +572,31 @@ class DDoSController:
             'syn_rate_pps':     syn_rate_pps,
             'duration_s':       duration_s,
         }
-        is_attack = self.model.predict(feats)
+        is_attack = self.model.predict(feats)   # per-WINDOW verdict (may be noisy)
 
-        log.info(f"THRESHOLD   [{sw_name}]  {src_ip} -> :{dst_port}  "
-                 f"syn={syn_count} ack={ack_count} unacked={unacked} "
-                 f"compl={completion_ratio:.2f} pps={syn_rate_pps:.1f} dur={duration_s:.2f}s "
-                 f"-> {'ATTACK' if is_attack else 'BENIGN'}")
+        # Reputation / hysteresis: a single bad window must NOT block. Move the
+        # flow's score (+REWARD benign, -PENALTY attack) and block only once it
+        # has behaved like an attack across enough windows to reach BLOCK_SCORE.
+        delta = -SCORE_PENALTY if is_attack else SCORE_REWARD
+        score = self.flow_table.bump_score(flow_key, delta, SCORE_CAP)
+        should_block = score <= BLOCK_SCORE
 
-        if is_attack:
+        log.info(f"THRESHOLD   [{sw_name}]  {src_ip} -> :{dst_port}  [window] "
+                 f"synΔ={syn_count} ackΔ={ack_count} unacked={unacked} "
+                 f"compl={completion_ratio:.2f} pps={syn_rate_pps:.1f} win={duration_s:.3f}s "
+                 f"score={score} -> {'ATTACK' if is_attack else 'BENIGN'}"
+                 f"{'  [BLOCK]' if should_block else ''}")
+
+        if self._eval_csv is not None:
+            with self._csv_lock:
+                self._eval_csv.write(
+                    f"{timestamp},{sw_name},{src_ip},{dst_port},{syn_count},{ack_count},"
+                    f"{unacked},{completion_ratio:.4f},{syn_rate_pps:.2f},{duration_s:.4f},"
+                    f"{'ATTACK' if is_attack else 'BENIGN'},{score},"
+                    f"{'BLOCK' if should_block else ''}\n")
+                self._eval_csv.flush()
+
+        if should_block:
             # atomic check-and-reserve: if two detectors flag the same attacker
             # at once, only the FIRST thread past this lock pushes the rule.
             with self._lock:
@@ -518,7 +606,7 @@ class DDoSController:
                 self.stats['attacks'] += 1
             log.warning(
                 f"\n{'─'*48}\n"
-                f"  ATTACK DETECTED\n"
+                f"  ATTACK DETECTED  (score {score} <= {BLOCK_SCORE})\n"
                 f"  src     : {src_ip}  (via {sw_name})\n"
                 f"  syn={syn_count} ack={ack_count} unacked={unacked} "
                 f"completion_ratio={completion_ratio:.2f}\n"
@@ -528,7 +616,10 @@ class DDoSController:
             self._push_block_rule(src_ip)
         else:
             with self._lock:
-                self.stats['benign'] += 1
+                if is_attack:
+                    self.stats['suspicious'] += 1   # bad window, not yet blocked
+                else:
+                    self.stats['benign'] += 1
 
     def _handle_evidence(self, members, sw_name):
         src_ip   = _bytes_to_ipv6(members[0].bitstring)
@@ -609,7 +700,7 @@ class DDoSController:
                     n_blocked = len(self.blocked_ips)
                 log.info(f"STATS | FirstSeen:{s['first_seen']}  "
                          f"Threshold:{s['threshold']}  Evidence:{s['evidence']}  "
-                         f"Attacks:{s['attacks']}  Benign:{s['benign']}  "
+                         f"Benign:{s['benign']}  Suspicious:{s['suspicious']}  "
                          f"Blocked:{n_blocked}")
         except KeyboardInterrupt:
             with self._lock:
@@ -620,8 +711,9 @@ class DDoSController:
             print(f"  FIRST_SEEN digests  : {s['first_seen']}")
             print(f"  THRESHOLD digests   : {s['threshold']}")
             print(f"  EVIDENCE digests    : {s['evidence']}")
-            print(f"  Attacks detected    : {s['attacks']}")
-            print(f"  Benign flows        : {s['benign']}")
+            print(f"  Benign windows      : {s['benign']}")
+            print(f"  Suspicious windows  : {s['suspicious']}   (bad window, score not yet at block)")
+            print(f"  Block events        : {s['attacks']}")
             print(f"  IPs blocked         : {n_blocked}")
             print("=" * 60)
 

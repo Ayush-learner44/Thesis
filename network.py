@@ -110,25 +110,20 @@ print("""
 
   STEP 3 — SERVER  (open h0 xterm, run before traffic):
     xterm h0
-    python3 /home/ayush/my2/server.py
+    python3 /home/ayush/my2/server_nginx.py     # nginx over IPv6
 
-  STEP 4 — TRAFFIC  (paste into mininet CLI below):
+  STEP 4 — TRAFFIC  (set MODE in launch_v2.py, then paste into mininet CLI):
 
-    run_all.py    h1+h2 attack | h3+h4+h5 legit  (other hosts idle)
-      py exec(open('/home/ayush/my2/run_all.py').read(), {'net': net, '__builtins__': __builtins__})
+    benign / flash / attack / spoof / mixed
+      py exec(open('/home/ayush/my2/launch_v2.py').read(), {'net': net, '__builtins__': __builtins__})
 
-    attacks.py    h1..h5 all attack
-      py exec(open('/home/ayush/my2/attacks.py').read(), {'net': net, '__builtins__': __builtins__})
+    low-rate DDoS sweep (find minimum detected pps)
+      py exec(open('/home/ayush/my2/lrddos_sweep.py').read(), {'net': net, '__builtins__': __builtins__})
 
-    flooding.py   h1..h5 flash crowd
-      py exec(open('/home/ayush/my2/flooding.py').read(), {'net': net, '__builtins__': __builtins__})
+  STEP 5 — ANALYSE  (after a run):
+    python3 /home/ayush/my2/analyze_evals.py
 
-    legit-traffic.py   h1..h5 slow legit traffic
-      py exec(open('/home/ayush/my2/legit-traffic.py').read(), {'net': net, '__builtins__': __builtins__})
-
-  STEP 5 — VERIFY  (Ctrl+C server.py first, then):
-    python3 /home/ayush/my2/verify.py
-
+  See RUNBOOK.md for the full workflow.
 ================================================================\033[0m
 """)
 

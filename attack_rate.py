@@ -48,7 +48,7 @@ ap.add_argument('--rand-port', dest='rand_port', action='store_true',
                      'the counter accumulates (measures the detector floor).')
 args = ap.parse_args()
 
-FIXED_SPORT = 20000   # matches legit.py/attack.py: one flow -> one CMS bucket
+FIXED_SPORT = 20000   # fixed src port -> one flow lands in one CMS bucket
 
 IPV6_MAP = {'h0': '2001:1:1::100'}
 IPV6_MAP.update({f'h{i}': f'2001:1:1::{i:x}' for i in range(1, 61)})

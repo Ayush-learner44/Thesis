@@ -8,7 +8,7 @@ launch_v2.py  --  Live-testbed traffic using the "real" tools.
   mixed   : attackers flood + everyone else runs ab benign
 
 Run from the mininet> prompt:
-    py exec(open('/home/ayush/my2/traffic_v2/launch_v2.py').read(), {'net': net, '__builtins__': __builtins__})
+    py exec(open('/home/ayush/my2/launch_v2.py').read(), {'net': net, '__builtins__': __builtins__})
 
 Requires on the hosts: apache2-utils (ab), scapy. See RUNBOOK.md.
 """
@@ -21,7 +21,7 @@ ATTACK_SECONDS = 3
 
 VIP  = '2001:1:1::100'
 VMAC = 'aa:00:00:00:00:00'
-ATK  = '/home/ayush/my2/traffic_v2/attack_short.py'
+ATK  = '/home/ayush/my2/attack_short.py'
 
 ALL       = [f'h{i}' for i in range(1, 61)]
 ATTACKERS = [f'h{i}' for i in range(1, 11)] + [f'h{i}' for i in range(31, 41)]  # h1-10, h31-40
@@ -78,5 +78,10 @@ else:
     print(f'[launch_v2] unknown MODE {MODE}')
 
 print('=' * 60)
-print('[launch_v2] launched. attackers stop after %ds; ab finishes on its own.' % ATTACK_SECONDS)
+if MODE in ('benign', 'flash'):
+    print(f'[launch_v2] launched. NO attackers in {MODE} mode — ab finishes on its own.')
+elif MODE in ('attack', 'spoof'):
+    print(f'[launch_v2] launched. attackers stop after {ATTACK_SECONDS}s.')
+else:  # mixed
+    print(f'[launch_v2] launched. attackers stop after {ATTACK_SECONDS}s; ab finishes on its own.')
 print('=' * 60)

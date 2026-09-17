@@ -10,7 +10,7 @@ empirically: each attacker floods at a different fixed rate; whichever
 source IPs the controller blocks tells you the real minimum detected rate.
 
 Run from the mininet> prompt (network + controller + server already up):
-    py exec(open('/home/ayush/my2/traffic_v2/lrddos_sweep.py').read(), {'net': net, '__builtins__': __builtins__})
+    py exec(open('/home/ayush/my2/lrddos_sweep.py').read(), {'net': net, '__builtins__': __builtins__})
 
 Then read the controller log: the LOWEST pps whose source IP is Blocked
 is your minimum detected attack rate. Anything below that EVADES -> that's
@@ -21,8 +21,13 @@ the 32-SYN threshold once. NOTE: at 1 pps that host runs ~40s -- the slow
 rates dominate runtime. Trim RATES if you want it faster.
 """
 
-ATK    = '/home/ayush/my2/traffic_v2/attack_rate.py'
-COUNT  = 40                                  # > 32-SYN threshold, one eval
+ATK    = '/home/ayush/my2/attack_rate.py'
+COUNT  = 100                                 # ~3 windows of 32 SYNs, so a
+                                             # sustained attacker crosses the
+                                             # reputation block score (needs >=2
+                                             # bad windows). A real flood sends
+                                             # far more; 40 was single-window only.
+                                             # NOTE: h1 at 1 pps now runs ~100s.
 RATES  = [1, 2, 5, 10, 25, 50, 100, 250]     # pps ladder -> h1..h8
 
 print('=' * 62)

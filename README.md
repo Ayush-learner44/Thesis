@@ -1,19 +1,18 @@
 # P4-Based SYN Flood DDoS Detection — Full Diamond Topology
 
-In-network SYN flood DDoS detection and mitigation on BMv2 P4 software switches using a **5-switch full-diamond topology** (2 splitters × 3 detectors). The system combines a **Count-Min Sketch (CMS)** in the data plane with a **5-model ML ensemble** in the control plane to detect and block SYN flood attackers across multiple asymmetric routing scenarios — without packet sampling, mirroring, or external monitoring.
+In-network SYN flood DDoS detection and mitigation on BMv2 P4 software switches using a **5-switch full-diamond topology** (2 splitters × 3 detectors). Each detector runs a **Count-Min Sketch (CMS)** in the data plane; the control-plane controller reconstructs each flow's behaviour from digests, scores it with a **lean trained model over 6 computable features**, and blocks sustained attackers using a **reputation / hysteresis rule** — without packet sampling, mirroring, or external monitoring.
 
 Splitter routing is **table-driven**: a single compile supports 10 different asymmetric-routing scenarios, selectable at controller startup. No recompile between experiments.
 
-Improves on the P4M3 paper baseline (86% recall, 89% F1).
+## Headline results (scenario 3 — the even 3-way SYN split, the hardest case)
 
-**Headline numbers** (60 attackers, threshold = 32, full diamond):
+| Traffic (generated with real tools) | Result |
+|---|---|
+| Steady benign (ApacheBench, 60 hosts) | **0% false positives** (0 blocked / ~278 windows) |
+| Flash crowd (ApacheBench, high concurrency) | **0% false positives** (0 blocked / ~480 windows) |
+| Low-rate attack sweep (1 → 250 pps, scapy) | **100% detection**, all 8 blocked, **floor at 1 pps** |
 
-| Scenario                  | SYN split          | ACK split          | Recall    | Precision | F1      |
-|---------------------------|--------------------|--------------------|-----------|-----------|---------|
-| 1 — Baseline asymmetry    | 100/0/0            | 0/100/0            | ~97.5%    | 100%      | ~98.7%  |
-| 6 — ECMP-realistic noise  | 80/10/10           | 10/80/10           | ~97.0%    | 100%      | ~98.5%  |
-| 7 — Cross-contamination   | 70/30/0            | 30/70/0            | ~96.8%    | 100%      | ~98.4%  |
-| 3 — Even 3-way SYN (worst) | 33/33/33          | 0/100/0            | ~94.5%    | 100%      | ~97.2%  |
+→ Precision ≈ 100%, Recall 100% (down to 1 pps), FPR 0% on benign + flash. Benign traffic is generated with **ApacheBench** (real HTTP handshakes) and attacks with **scapy** (IPv6 SYN flood), so the numbers reflect real client/attacker behaviour rather than synthetic loops.
 
 ---
 
@@ -24,13 +23,12 @@ Improves on the P4M3 paper baseline (86% recall, 89% F1).
 3. [Prerequisites & Installation](#prerequisites--installation)
 4. [Project Structure](#project-structure)
 5. [P4 Data Plane](#p4-data-plane)
-6. [Control Plane & ML Ensemble](#control-plane--ml-ensemble)
+6. [Control Plane — Detection & Mitigation](#control-plane--detection--mitigation)
 7. [Running the System](#running-the-system)
-8. [Traffic Scripts](#traffic-scripts)
+8. [Traffic & Analysis Tools](#traffic--analysis-tools)
 9. [The 10 Routing Scenarios](#the-10-routing-scenarios)
-10. [Verification & Metrics](#verification--metrics)
-11. [Key Design Decisions](#key-design-decisions)
-12. [Limitations & Math](#limitations--math)
+10. [Key Design Decisions](#key-design-decisions)
+11. [Limitations & Future Work](#limitations--future-work)
 
 ---
 
@@ -39,35 +37,22 @@ Improves on the P4M3 paper baseline (86% recall, 89% F1).
 ```
 ┌────────────────────────────────────────────────────────────────────┐
 │                          CONTROL PLANE                             │
-│                                                                    │
 │   controller.py                                                    │
-│   ┌────────────────────────────────────────────────────────────┐   │
-│   │  pick_scenario()           EnsembleClassifier              │   │
-│   │      │                     (KNN+RF+DT+XGB+SVM → majority)  │   │
-│   │      ↓                              │                      │   │
-│   │  install syn_split + ack_split       │                      │   │
-│   │  (100 entries each, on s1 and s2)    │                      │   │
-│   │                                      │                      │   │
-│   │  FlowTable                  THRESHOLD handler              │   │
-│   │  [start_time, ack_count]         │                         │   │
-│   │      │                           │                         │   │
-│   │  FIRST_SEEN    EVIDENCE          │                         │   │
-│   │  handler       handler           │                         │   │
-│   │      └─────────────┬──────────────┘                         │   │
-│   │             gRPC / P4Runtime (5 switches)                  │   │
-│   └────────────────────┼───────────────────────────────────────┘   │
+│     pick_scenario()                                                │
+│     LeanModel (single classifier, 6 features)                      │
+│     FlowTable [first_seen, ack_count, last_eval, last_cms, score]  │
+│     FIRST_SEEN / THRESHOLD / EVIDENCE digest handlers              │
+│     reputation score  →  block on all detectors when score <= -2   │
+│              gRPC / P4Runtime (5 switches)                         │
 └────────────────────────┼───────────────────────────────────────────┘
-                         │ table_add (block rule → A + B + C)
+                         │ block rule (src IP → drop on A + B + C)
 ┌────────────────────────┼───────────────────────────────────────────┐
 │                      DATA PLANE (BMv2)                             │
-│                                                                    │
 │   h1..h30  ─── s1 ──┐               ┌── A ──┐                      │
 │                     ├──(full diamond,┤       │                     │
 │   h31..h60 ── s2 ──┘  no s1↔s2 link) │── B ──┤── h0 (3 NICs        │
-│                                      │       │      same MAC      │
-│                                      └── C ──┘      IPv6 only on  │
-│                                                     eth0 = A path)│
-│                                                                    │
+│                                      │       │      same MAC,      │
+│                                      └── C ──┘      IPv6 on eth0)  │
 │   s1, s2  : traffic_splitter.p4 (table-driven hash-bucket routing) │
 │   A, B, C : ddos_detector.p4    (identical CMS + 3 digest types)   │
 └────────────────────────────────────────────────────────────────────┘
@@ -75,10 +60,10 @@ Improves on the P4M3 paper baseline (86% recall, 89% F1).
 
 **Detection flow:**
 
-1. Splitters `s1`/`s2` hash each TCP packet's `(src_ip, src_port, dst_port)` into a 0..99 bucket. The bucket is looked up in `syn_split` (for pure SYNs) or `ack_split` (for everything else). Each table is filled at runtime by the controller based on the chosen scenario.
-2. Each detector runs the same CMS detector P4 — increments a Count-Min Sketch on every pure SYN, fires `FIRST_SEEN` digests on new flows, fires `THRESHOLD` digests every 32 SYNs (lowered from 64 in the baseline paper to compensate for SYN-fraction dilution under ECMP splits — see [Limitations & Math](#limitations--math)).
-3. ACKs arriving at a detector that hasn't seen the corresponding SYN (because it took a different path) fire `EVIDENCE` digests. The controller accumulates `ack_count` per flow_key across all detectors.
-4. At each THRESHOLD, the controller computes `pps = max(0, cms_min - ack_count) / elapsed`. If the 5-model ML ensemble votes ATTACK (≥3/5), the drop rule is installed on **all three** detectors so the attacker is blocked regardless of which path they next use.
+1. Splitters `s1`/`s2` hash each TCP packet's `(src_ip, src_port, dst_port)` into a 0..99 bucket, looked up in `syn_split` (pure SYNs) or `ack_split` (everything else). The controller fills these tables at runtime per the chosen scenario.
+2. Each detector runs the same CMS P4 — increments the sketch on every pure SYN, fires `FIRST_SEEN` on new flows, and fires a `THRESHOLD` digest every 32 SYNs. A pure ACK decrements the sketch; an ACK arriving where the SYN was never seen (asymmetric path) fires an `EVIDENCE` digest.
+3. At each THRESHOLD the controller computes **windowed** features for the flow *since its previous evaluation* (an atomic snapshot-and-reset): `syn_count`, `ack_count`, `unacked`, `completion_ratio`, `syn_rate_pps`, `duration_s`, and asks the lean model for a per-window verdict.
+4. A single bad window does **not** block. Each flow carries a reputation **score** (+1 benign window, −1 attack window, capped at +3). The drop rule is installed on **all three** detectors only when the score reaches **−2** — i.e. the flow behaved like an attack across several windows.
 
 ---
 
@@ -86,87 +71,51 @@ Improves on the P4M3 paper baseline (86% recall, 89% F1).
 
 ```
    h1  (2001:1:1::1)   ─ port  1 ──┐
-   h2  (2001:1:1::2)   ─ port  2 ──┤
    ...                              ├─ s1 ─┐
    h30 (2001:1:1::1e)  ─ port 30 ──┘  31│32│33  ──┐         ┌── A ── h0-eth0
                                           │  │  │           │
    h31 (2001:1:1::1f)  ─ port  1 ──┐  31│32│33  ──┤────────├── B ── h0-eth1
-   h32 (2001:1:1::20)  ─ port  2 ──┤      │  │  │           │
    ...                              ├─ s2 ─┘                └── C ── h0-eth2
    h60 (2001:1:1::3c)  ─ port 30 ──┘
 ```
 
 ### Port assignments
 
-| Switch | Port | Connected to             |
-|--------|------|--------------------------|
-| s1     | 1–30 | h1..h30 (clients)        |
-| s1     | 31   | A port 1                 |
-| s1     | 32   | B port 1                 |
-| s1     | 33   | C port 1                 |
-| s2     | 1–30 | h31..h60 (clients)       |
-| s2     | 31   | A port 2                 |
-| s2     | 32   | B port 2                 |
-| s2     | 33   | C port 2                 |
-| A      | 1    | s1 port 31               |
-| A      | 2    | s2 port 31               |
-| A      | 3    | h0-eth0                  |
-| B      | 1    | s1 port 32               |
-| B      | 2    | s2 port 32               |
-| B      | 3    | h0-eth1                  |
-| C      | 1    | s1 port 33               |
-| C      | 2    | s2 port 33               |
-| C      | 3    | h0-eth2                  |
+| Switch | Port | Connected to        |
+|--------|------|---------------------|
+| s1     | 1–30 | h1..h30 (clients)   |
+| s1     | 31/32/33 | A/B/C port 1    |
+| s2     | 1–30 | h31..h60 (clients)  |
+| s2     | 31/32/33 | A/B/C port 2    |
+| A/B/C  | 1    | s1                  |
+| A/B/C  | 2    | s2                  |
+| A/B/C  | 3    | h0-eth0/eth1/eth2   |
 
-**No `s1↔s2` link.** Both splitters connect directly to every detector — each detector is equidistant from each splitter. This avoids the cross-splitter bottleneck that a "shared backbone" topology would introduce.
+**No `s1↔s2` link.** Both splitters connect directly to every detector — each detector is equidistant from each splitter, so there is no shared backbone that would bias asymmetric-routing measurements.
 
 ### Host addresses
 
-| Host   | IPv6 address      | MAC                | Role                |
-|--------|-------------------|--------------------|---------------------|
-| h0     | 2001:1:1::100     | aa:00:00:00:00:00  | Server (victim)     |
-| h1     | 2001:1:1::1       | aa:00:00:00:00:01  | Client (s1)         |
-| h2     | 2001:1:1::2       | aa:00:00:00:00:02  | Client (s1)         |
-| ...    | ...               | ...                | ...                 |
-| h15    | 2001:1:1::f       | aa:00:00:00:00:0f  | Client (s1)         |
-| h16    | 2001:1:1::10      | aa:00:00:00:00:10  | Client (s1)         |
-| ...    | ...               | ...                | ...                 |
-| h30    | 2001:1:1::1e      | aa:00:00:00:00:1e  | Client (s1)         |
-| h31    | 2001:1:1::1f      | aa:00:00:00:00:1f  | Client (s2)         |
-| ...    | ...               | ...                | ...                 |
-| h60    | 2001:1:1::3c      | aa:00:00:00:00:3c  | Client (s2)         |
+| Host | IPv6 | MAC | Role |
+|------|------|-----|------|
+| h0   | 2001:1:1::100 | aa:00:00:00:00:00 | Server (victim) |
+| h_i  | 2001:1:1::{i:x} | aa:00:00:00:00:{i:02x} | Clients (h1..h30 on s1, h31..h60 on s2) |
 
-**h0 uses `2001:1:1::100`** (NOT `::10`) — this avoids a collision with h16's natural address (`16 decimal = 0x10`). Clients live on `::1..::3c`. h0 is well above that range.
-
-h0 has the **same MAC** on all three interfaces — L2 tables on each detector switch need only one entry for h0. h0's IPv6 (`2001:1:1::100/64`) is assigned only to eth0; Linux's weak-host model accepts packets on eth1 and eth2 too, and responses always leave via eth0.
-
-**IPv6 only.** No IPv4. All traffic uses the `2001:1:1::/64` prefix. Static NDP entries are pre-installed by `server.py` (60 entries) and each client script (self-assigns from IPV6_MAP fallback).
+**h0 uses `::100`** (not `::10`) to avoid colliding with h16's natural address (`16 = 0x10`). h0 has the **same MAC** on all three interfaces (one L2 entry per detector), its IPv6 is on eth0 only, and Linux's weak-host model accepts packets on eth1/eth2. **IPv6-only** on `2001:1:1::/64`. NDP is static (set up by `server_nginx.py` and the traffic launcher) since the P4 path is unicast-only.
 
 ---
 
 ## Prerequisites & Installation
 
-### System requirements
-- Ubuntu 20.04 / 22.04 (or WSL2 with Ubuntu)
-- Python 3.8+
-- p4-utils (BMv2 + p4c + p4runtime tools)
-- Mininet
-
-### Python dependencies
 ```bash
-pip3 install scapy numpy scikit-learn xgboost
-```
+# System: Ubuntu 20.04/22.04 or WSL2; Python 3.8+; p4-utils (BMv2 + p4c); Mininet
+pip3 install scapy numpy scikit-learn xgboost pandas
+sudo apt install -y apache2-utils nginx      # ab (benign client) + nginx (victim server)
 
-### Verify p4-utils is installed
-```bash
+# check p4-utils
 python3 -c "from p4utils.mininetlib.network_API import NetworkAPI; print('ok')"
 ```
 
-### ML models
-Trained models live in `ml/models/`. If missing, retrain from CIC-DDoS2019:
-```bash
-python3 ml/train_models.py --csv /path/to/Syn.csv
-```
+The trained model (`ml/models/lean_model.pkl` + `lean_feature_order.pkl`) is included. It was trained on a purpose-built, honestly-labelled dataset generated with real tools (hping3 / ApacheBench / NFStream) on a separate testbed — not on the flawed public CIC-DDoS2019 SYN CSV.
 
 ---
 
@@ -174,439 +123,169 @@ python3 ml/train_models.py --csv /path/to/Syn.csv
 
 ```
 my2/
-├── network.py                       # Mininet topology — 5-switch full diamond
+├── network.py             # Mininet topology — 5-switch full diamond
 ├── p4src/
-│   ├── traffic_splitter.p4          # s1, s2 — table-driven SYN/ACK splitter
-│   ├── traffic_splitter.json        # Compiled BMv2 JSON (auto-generated)
-│   ├── traffic_splitter_p4rt.txt    # P4Info (auto-generated)
-│   ├── ddos_detector.p4             # A, B, C — CMS detector + 3 digests
-│   ├── ddos_detector.json           # Compiled BMv2 JSON (auto-generated)
-│   └── ddos_detector_p4rt.txt       # P4Info (auto-generated)
+│   ├── traffic_splitter.p4 (+ .json, _p4rt.txt)   # s1, s2 — table-driven splitter
+│   └── ddos_detector.p4    (+ .json, _p4rt.txt)   # A, B, C — CMS detector + 3 digests
 ├── controller/
-│   └── controller.py                # gRPC controller — 5 switches, scenario picker
-├── ml/
-│   ├── train_models.py
-│   └── models/                      # 5 pickled models + scaler
-├── server.py                        # IPv6 TCP server on h0 — tcpdump on 3 NICs
-├── attack.py                        # SYN flood — 2000 raw Scapy SYNs per host
-├── attacks.py                       # Run attack.py on all 60 hosts
-├── traffic.py                       # Legit TCP — 80 conns/host at 3/sec
-├── legit-traffic.py                 # Run traffic.py on all 60 hosts
-├── flood.py                         # Flash crowd — 200 conns/host (4 phases)
-├── flooding.py                      # Run flood.py on all 60 hosts
-├── legit.py                         # Single-host BENIGN demo (Scapy, 8 pps)
-├── run_all.py                       # Mixed: 20 atk (h1-h10, h31-h40) +
-│                                    #         40 legit (h11-h30, h41-h60)
-├── verify.py                        # Post-experiment pcap metrics (3 pcaps)
-├── test.txt                         # Full scenario + FN/recall math doc
-├── limitation.txt                   # BMv2 throughput + multiplier rationale
-└── topology.json                    # Auto-generated by p4-utils at runtime
+│   └── controller.py      # P4Runtime controller: lean model + windowing + reputation score
+├── ml/models/
+│   ├── lean_model.pkl              # single trained classifier (6 features)
+│   └── lean_feature_order.pkl      # feature order used at inference
+├── server_nginx.py        # victim server on h0 — nginx over IPv6 (+ NDP setup, pcaps)
+├── nginx_h0.conf          # standalone nginx config (IPv6, high backlog)
+├── launch_v2.py           # traffic launcher — benign / flash / attack / spoof / mixed
+├── attack_rate.py         # hping3-style IPv6 SYN flooder (rate / count / flood / spoof)
+├── attack_short.py        # short (<5s) IPv6 SYN flood
+├── lrddos_sweep.py        # low-rate DDoS sweep (1..250 pps) — finds the detection floor
+├── analyze_evals.py       # reads /tmp/threshold_evals.csv → FP / detection breakdown
+├── RUNBOOK.md             # step-by-step run instructions
+├── TODO.md                # design notes + deferred work
+├── topology.json          # auto-generated by p4-utils at runtime
+├── weekly reports.txt     # progress reports
+└── resume.txt             # CV bullet content
 ```
 
 ---
 
 ## P4 Data Plane
 
-### `traffic_splitter.p4` — runs on `s1` and `s2` (table-driven)
+### `traffic_splitter.p4` — runs on `s1` and `s2`
 
-Splits client→server traffic by TCP flag, but with **runtime-configurable percentages**. Two tables (`syn_split` and `ack_split`) are keyed on a CRC16 hash bucket of `(src_ip, src_port, dst_port)` mod 100. The controller fills these tables with entries that realise the chosen scenario's SYN/ACK distribution.
+Splits client→server traffic by TCP flag with **runtime-configurable percentages**. `syn_split` (pure SYNs) and `ack_split` (everything else) are keyed on `crc16({src_ip, src_port, dst_port}) mod 100`. Return traffic (ingress port 31/32/33) is L2-forwarded unchanged, never re-classified.
 
-Return traffic (from detector → splitter) is L2-forwarded unchanged — the ingress port check (31, 32, 33) prevents the splitter from running its split logic on return traffic.
+### `ddos_detector.p4` — runs on `A`, `B`, `C` (identical)
 
-**Apply logic:**
-```
-if ingress_port in {31, 32, 33}:        // from a detector — return path
-    l2_forward()
-else if tcp.isValid() and ipv6.isValid():
-    bucket = crc16({src_ip, src_port, dst_port}) mod 100
-    if pure SYN (SYN=1, ACK=0):
-        syn_split.apply()                // controller decides destination
-    else:                                // ACK, SYN-ACK, FIN, data
-        ack_split.apply()
-else:                                    // non-TCP
-    l2_forward()
-```
+**Pipeline:** `dangerous_table` (drop blocklisted src IP) → CMS logic → `l2_forward`.
 
-Each table holds 100 entries — one per bucket. Different scenarios just mean different `send_to_A` / `send_to_B` / `send_to_C` actions for different bucket ranges.
+| CMS parameter | Value |
+|---|---|
+| Rows × Columns | 2 × 1024, 32-bit counters (~8 KiB/detector) |
+| Hash | CRC16 & CRC32 on `{src_ip, dst_ip, dst_port, proto}` |
+| Increment | pure SYN (SYN=1, ACK=0) |
+| Decrement | pure ACK (ACK=1, SYN=0) — **not** SYN-ACK |
+| `cms_min` | `min(c0, c1)` |
+
+**Flow key:** `(src_ip, dst_ip, dst_port, protocol)` — source port excluded, so all connections from one host to one port accumulate in one counter. **THRESHOLD** fires when `cms_min & 0x1F == 0` (every 32 SYNs, lowered from 64 to compensate for SYN-fraction dilution under 3-way splits).
+
+**Digests** (controller tells them apart by field count): `first_seen_digest_t` (5), `threshold_digest_t` (6, carries `cms_min`), `evidence_digest_t` (4). EVIDENCE fires when a pure ACK hits a detector whose CMS row for that flow is zero — i.e. the SYN took a different path (asymmetric-routing reconstruction).
 
 ---
 
-### `ddos_detector.p4` — runs on `A`, `B`, and `C` (identical)
+## Control Plane — Detection & Mitigation
 
-All three detector switches run **identical P4 logic**. Their behaviour differs only because of which traffic the splitters route to each.
+**File:** `controller/controller.py` (P4Runtime / gRPC).
 
-#### Packet pipeline (ingress order)
+### Startup
+Pick scenario (1–10) → connect to 5 switches → **reset switch state** (clear `dangerous_table` + zero CMS registers over thrift, so every restart is a clean slate without restarting Mininet) → install L2 + split tables → enable digests → one receiver thread per detector.
 
+### FlowTable (windowed)
+`flow_key → [first_seen_us, ack_count, last_eval_us, last_cms_syn, score]`, bounded (LRU), lock-protected.
+- `first_seen_us` — immutable flow-age reference (logging only).
+- `ack_count` — EVIDENCE-reconstructed remote ACKs **this window** (reset each eval).
+- `last_eval_us`, `last_cms_syn` — window clock and CMS snapshot.
+- `score` — reputation score (cross-window memory).
+
+### THRESHOLD handler — windowed features + reputation
+On each THRESHOLD, `snapshot_and_reset()` atomically reads the window and resets it (ACKs arriving after count toward the next window — no race, none lost). Features for the window:
 ```
-Packet in
-   │
-   ▼
-① dangerous_table       ← drop if src_ip is blocklisted → EXIT
-   │
-   ▼
-② Parse TCP flags
-   ├── pure SYN (SYN=1, ACK=0)?
-   │       ├── compute CMS indices: CRC16 → idx0, CRC32 → idx1
-   │       ├── read c0, c1
-   │       ├── if (c0==0 || c1==0) → FIRST_SEEN digest
-   │       ├── c0++, c1++; write back
-   │       ├── cms_min = min(c0, c1)
-   │       └── if (cms_min & 0x1F == 0 && cms_min > 0) → THRESHOLD digest
-   │                          ▲
-   │                          └── every 32 SYNs (lowered from every 64)
-   │
-   └── pure ACK (ACK=1, SYN=0)?
-           ├── read c0, c1
-           ├── if (c0==0 || c1==0) → EVIDENCE digest
-           └── if c0>0: c0--; if c1>0: c1--; write back
-   │
-   ▼
-③ l2_forward            ← forward by destination MAC
+syn_count        = cms_min - last_cms_syn        (≈32 in the asymmetric case)
+ack_count        = remote ACKs this window
+unacked          = max(0, syn_count - ack_count)
+completion_ratio = ack_count / syn_count
+syn_rate_pps     = syn_count / window_duration
+duration_s       = window_duration
 ```
+The lean model returns a per-window verdict. The flow's score moves `+1` (benign) or `−1` (attack, capped at +3), and the drop rule is pushed to **A, B, and C** only when `score <= -2`. So a transient bad window (e.g. an RTT-lagged completion) is absorbed, while a sustained attacker crosses −2 within ~2 windows.
 
-#### Count-Min Sketch (CMS)
+### Lean model
+A single trained classifier (RandomForest/XGBoost) over the 6 features above — no 5-model ensemble, no packet-rate scaling hack. Features are defined identically in training and at runtime.
 
-| Parameter  | Value                                              |
-|------------|----------------------------------------------------|
-| Rows       | 2                                                  |
-| Columns    | 1024                                               |
-| Cell width | 32-bit counter                                     |
-| Hash row 0 | CRC16 on `{src_ip, dst_ip, dst_port, proto}`       |
-| Hash row 1 | CRC32 on `{src_ip, dst_ip, dst_port, proto}`       |
-| Memory     | 2 × 1024 × 32 = 65,536 bits = **8 KiB per detector** |
-| Increment  | pure SYN only (SYN=1, ACK=0)                       |
-| Decrement  | pure ACK only (ACK=1, SYN=0) — **NOT SYN-ACK**     |
-| `cms_min`  | `min(c0, c1)` after increment                      |
-
-**Flow key:** `(src_ip, dst_ip, dst_port, protocol)` — source port excluded. All connections from one host to one server port accumulate in one bucket regardless of ephemeral source port.
-
-**THRESHOLD mask: `0x1F`** — fires every 32 SYNs. Lowered from `0x3F` (every 64) in the baseline paper because with multi-detector ECMP splits each detector sees only a fraction of an attacker's SYNs. See [Limitations & Math](#limitations--math) for the derivation.
-
-#### Digest structs
-
-**`first_seen_digest_t`** (5 fields) — first SYN of a new flow:
-```
-src_ip    bit<128>
-dst_ip    bit<128>
-dst_port  bit<16>
-protocol  bit<8>
-timestamp bit<48>    # ingress_global_timestamp (microseconds)
-```
-
-**`threshold_digest_t`** (6 fields) — every 32 SYNs:
-```
-src_ip    bit<128>
-dst_ip    bit<128>
-dst_port  bit<16>
-protocol  bit<8>
-cms_min   bit<32>
-timestamp bit<48>
-```
-
-**`evidence_digest_t`** (4 fields) — ACK arrived on a switch that never saw the SYN:
-```
-src_ip    bit<128>
-dst_ip    bit<128>
-dst_port  bit<16>
-protocol  bit<8>
-```
-
-The controller identifies digest type by **field count**: 4 → evidence, 5 → first_seen, 6 → threshold.
-
-#### Tables
-
-| Table             | Key                       | Action(s)      | Size |
-|-------------------|---------------------------|----------------|------|
-| `dangerous_table` | `hdr.ipv6.srcAddr` (exact)| `drop`         | 1024 |
-| `l2_forward`      | `hdr.ethernet.dstAddr`    | `forward(port)`| 128  |
-
----
-
-## Control Plane & ML Ensemble
-
-**File:** `controller/controller.py`
-
-### Switch roles
-
-```python
-SPLITTER_SWITCHES = {'s1', 's2'}      # no digests, no block rules
-# A, B, C → detector switches (identical treatment)
-```
-
-### Startup sequence
-
-1. **Pick scenario** (interactive prompt — choose 1-10)
-2. Load 5 ML models + scaler from `ml/models/`
-3. Connect to all 5 switches via gRPC (P4Runtime)
-4. Install L2 forwarding rules on all 5 switches
-5. **Install `syn_split` + `ack_split` entries on s1 and s2** based on the chosen scenario (100 entries per table per splitter — 400 entries total)
-6. Enable all 3 digest types on A, B, C
-7. Spawn one digest receiver thread per detector switch
-8. Print "RUNNING" banner — **wait for this before launching traffic**
-
-### FlowTable
-
-Single in-memory table: `flow_key → [start_time_us, ack_count]`. Bounded at 100,000 entries (LRU eviction). Protected by a lock.
-
-- `start_time_us` — switch clock timestamp of the first SYN (from FIRST_SEEN digest)
-- `ack_count` — cumulative ACK evidence count, **never reset** — mirrors what the symmetric CMS hardware counter did (ACK decrements) in the single-switch baseline
-
-### Digest handlers
-
-- **FIRST_SEEN** — records the flow start time (no-op if already exists).
-- **EVIDENCE** — atomically increments `ack_count` for the flow_key.
-- **THRESHOLD** — looks up the flow's start_time and ack_count, computes:
-  ```
-  adjusted   = max(0, cms_min - ack_count)
-  elapsed    = (now - start_time) / 1_000_000
-  pps        = adjusted / elapsed
-  pps_scaled = pps × 5000
-  ```
-  Runs the ML ensemble on `pps_scaled`. If majority votes ATTACK, installs the drop rule on **A, B, and C**.
-
-The `× 5000` multiplier exists because the ML models were trained on CIC-DDoS2019 (line-rate hardware traffic in the millions of pps), while BMv2 produces SYN rates in the hundreds. See `limitation.txt` for the full rationale.
-
-### ML Ensemble
-
-| Model   | Type                      |
-|---------|---------------------------|
-| KNN     | K-Nearest Neighbors (k=5) |
-| RF      | Random Forest (100 trees) |
-| DT      | Decision Tree (depth=10)  |
-| XGBoost | Gradient Boosted Trees    |
-| SVM     | RBF kernel, C=1.0         |
-
-**Decision rule:** majority vote — ≥3/5 models predict ATTACK → block.
-
-**Feature:** `pps × 5000` (single scalar).
+Every evaluation is also dumped to `/tmp/threshold_evals.csv` for `analyze_evals.py`.
 
 ---
 
 ## Running the System
 
-### Correct startup order
+> **Mininet first, then the controller.** The controller reads `topology.json` and connects over gRPC — both only exist after `network.py` boots. **Restart only the controller between runs** — it auto-resets the CMS registers and block rules on startup, so Mininet and the server keep running.
 
-> ⚠️ **Mininet starts FIRST, then the controller.** The controller reads `topology.json` (written by Mininet at startup) and connects to switches via gRPC — both of which only exist after `network.py` has booted.
-
-**Step 1 — Start Mininet** (terminal 1):
 ```bash
-cd /home/ayush/my2
-sudo python3 network.py
-```
-Wait for the Mininet CLI prompt (`mininet>`) and for p4-utils to finish compiling both `.p4` files.
+# 1) Mininet (terminal A)
+cd /home/ayush/my2 && sudo python3 network.py         # wait for mininet> and P4 compile
 
-**Step 2 — Start the controller** (terminal 2):
-```bash
-cd /home/ayush/my2/controller
-python3 controller.py
-```
+# 2) Controller (terminal B) — pick a scenario at the prompt
+cd /home/ayush/my2/controller && python3 controller.py
 
-You'll see the scenario picker:
-```
-================================================================
-  DDoS Controller — Pick split scenario
-================================================================
-
-   1. Baseline — single SYN path, single ACK path
-        SYN: 100% -> A
-        ACK: 100% -> B
-
-   2. SYN split across 2 detectors (A+C), all ACKs on B
-        SYN:  50% -> A,   50% -> C
-        ACK: 100% -> B
-
-   ...
-
-  10. Mid-experiment shift — SYN path changes at t=30s
-        SYN: 100% -> A   ──►  50% -> A,  50% -> C  @ t=30s
-        ACK: 100% -> B
-
-Enter scenario [1-10]:
-```
-
-Pick a number. Then wait for:
-```
-============================================================
-DDoS Detection Controller RUNNING — scenario N
-============================================================
-```
-**This banner is the green light** — do not launch traffic before it appears.
-
-**Step 3 — Start the server on h0** (h0 xterm):
-```
+# 3) Server on h0 (mininet)
 mininet> xterm h0
-```
-In the h0 xterm:
-```bash
-python3 /home/ayush/my2/server.py
-```
-Wait for:
-```
-[server] tcpdump capturing on h0-eth0 -> /home/ayush/my2/capture_path_a.pcap
-[server] tcpdump capturing on h0-eth1 -> /home/ayush/my2/capture_path_b.pcap
-[server] tcpdump capturing on h0-eth2 -> /home/ayush/my2/capture_path_c.pcap
-[server] Listening on [::]:80 (IPv6)
+#   in the h0 xterm:
+python3 /home/ayush/my2/server_nginx.py
+
+# 4) Traffic — set MODE in launch_v2.py, then from the mininet prompt
+mininet> py exec(open('/home/ayush/my2/launch_v2.py').read(), {'net': net, '__builtins__': __builtins__})
+
+# 5) Analyse a run
+python3 /home/ayush/my2/analyze_evals.py
 ```
 
-**Step 4 — Run a traffic scenario** (Mininet CLI):
-```
-mininet> py exec(open('/home/ayush/my2/run_all.py').read(), {'net': net, '__builtins__': __builtins__})
-```
-
-**Step 5 — Stop and verify**:
-```
-Ctrl+C    # in h0 xterm (saves all 3 pcaps)
-python3 /home/ayush/my2/verify.py
-```
-
-### Important notes
-
-- **Always restart both Mininet and the controller between experiments.** BMv2 CMS registers persist across runs. The controller's `FlowTable` (start times, ack counts) and `blocked_ips` also persist. Restarting only the controller without Mininet creates state mismatch.
-- The `ALREADY_EXISTS` error on digest configuration means the controller was restarted without restarting Mininet. Restart both.
-- With 60 hosts the L2 + split rule install takes a few extra seconds at controller startup. Be patient — wait for the RUNNING banner.
+See **RUNBOOK.md** for the full workflow, modes, and the reset details.
 
 ---
 
-## Traffic Scripts
+## Traffic & Analysis Tools
 
-### Per-host scripts (run inside one host's namespace)
+| Tool | Purpose |
+|---|---|
+| `launch_v2.py` | Fan-out launcher. `MODE` = `benign` / `flash` (ApacheBench), `attack` / `spoof` (scapy), `mixed`. |
+| `attack_rate.py` | hping3-style IPv6 SYN flooder: `--rate N`, `--flood`, `--count`, `--duration`, `--spoof`, `--rand-port`. |
+| `attack_short.py` | Short (<5 s) IPv6 SYN flood. |
+| `lrddos_sweep.py` | Rate ladder (1 → 250 pps across 8 hosts) — measures the minimum detected rate. |
+| `analyze_evals.py` | Reads the per-eval CSV. In a benign run, **BLOCK rows are the true false positives** (a single ATTACK-verdict window is expected and absorbed by the score). |
+| `server_nginx.py` + `nginx_h0.conf` | Victim server (nginx, IPv6, high backlog) — completes handshakes under a 60-host flash crowd. |
 
-| Script        | Behaviour                          | Per-host total                              |
-|---------------|------------------------------------|---------------------------------------------|
-| `attack.py`   | SYN flood (Scapy, 4-phase pattern) | **2000 raw SYNs** at 1000 pps target (Phase 2/4) |
-| `traffic.py`  | Real TCP at 3 conns/sec            | **80 connections**                          |
-| `flood.py`    | Flash-crowd, 4 phases, mixed speed | **200 connections** (70 + 70 + 30 + 30)     |
-| `legit.py`    | Low-rate Scapy demo (BENIGN proof) | 80 SYNs at 8 pps                            |
-
-### Launchers (run from the Mininet CLI)
-
-| Launcher              | What it does                                                                | Total                                |
-|-----------------------|-----------------------------------------------------------------------------|--------------------------------------|
-| `attacks.py`          | Runs `attack.py` on **all 60 hosts** simultaneously                         | 60 × 2000 = **120,000 attack SYNs**  |
-| `flooding.py`         | Runs `flood.py` on **all 60 hosts** simultaneously                          | 60 × 200 = **12,000 connections**    |
-| `legit-traffic.py`    | Runs `traffic.py` on **all 60 hosts** simultaneously                        | 60 × 80 = **4,800 connections**      |
-| `run_all.py`          | Mixed: `attack.py` on h1-h10 + h31-h40; `traffic.py` on h11-h30 + h41-h60   | 20 atk × 2000 + 40 legit × 80 = **40,000 SYNs + 3,200 conns** |
-
-The launcher just fans out — each host's namespace runs its own copy of the per-host script.
+**Notes:** benign/flash use ApacheBench (real handshakes); attacks use scapy because the testbed is IPv6 and hping3 is IPv4-only. Spoofed / random-source-port floods are documented evasions (per-source CMS + SYN-split dilution) — see below.
 
 ---
 
 ## The 10 Routing Scenarios
 
-The controller picker offers 10 scenarios. Each installs different SYN/ACK split table entries on s1 and s2.
+Selectable at controller startup; each installs different `syn_split`/`ack_split` entries. Same compiled P4 for all.
 
-| # | Description                                            | SYN A/B/C   | ACK A/B/C   |
-|---|--------------------------------------------------------|-------------|-------------|
-| 1 | Baseline — single SYN path, single ACK path            | 100/0/0     | 0/100/0     |
-| 2 | SYN split across 2 detectors (A+C)                     | 50/0/50     | 0/100/0     |
-| 3 | SYN split across all 3 detectors                       | 33/33/33    | 0/100/0     |
-| 4 | All SYNs on A, ACK split across 2 detectors (B+C)      | 100/0/0     | 0/50/50     |
-| 5 | All SYNs on A, ACK split across all 3 detectors        | 100/0/0     | 33/33/33    |
-| 6 | ECMP-realistic — mild spread on both SYN and ACK       | 80/10/10    | 10/80/10    |
-| 7 | Cross-contamination — A and B BOTH see SYN and ACK     | 70/30/0     | 30/70/0     |
-| 8 | Max contamination — all 3 detectors see SYN and ACK    | 50/25/25    | 25/50/25    |
-| 9 | Mirror symmetry — same split for SYN and ACK           | 50/50/0     | 50/50/0     |
-| 10| Mid-experiment shift @ t=30s                           | 100/0/0 → 50/0/50 | 0/100/0 |
+| # | Description | SYN A/B/C | ACK A/B/C |
+|---|---|---|---|
+| 1 | Baseline — single SYN path, single ACK path | 100/0/0 | 0/100/0 |
+| 2 | SYN split across 2 detectors (A+C) | 50/0/50 | 0/100/0 |
+| 3 | **SYN split across all 3 (worst case)** | 33/33/33 | 0/100/0 |
+| 4 | All SYNs on A, ACK split (B+C) | 100/0/0 | 0/50/50 |
+| 5 | All SYNs on A, ACK split 3-way | 100/0/0 | 33/33/33 |
+| 6 | ECMP-realistic — mild spread both | 80/10/10 | 10/80/10 |
+| 7 | Cross-contamination | 70/30/0 | 30/70/0 |
+| 8 | Max contamination | 50/25/25 | 25/50/25 |
+| 9 | Mirror symmetry (negative control) | 50/50/0 | 50/50/0 |
+| 10 | Mid-experiment shift @ t=30s | 100/0/0 → 50/0/50 | 0/100/0 |
 
-See `test.txt` (section 8) for the full per-scenario rationale, expected metrics, and which is the "headline" / "negative control" / "worst case" for paper writing.
-
----
-
-## Verification & Metrics
-
-**File:** `verify.py`
-
-Reads **all 3 pcap files** captured by `server.py` (one per detector path) and produces:
-1. Per-path traffic breakdown (SYN / SYN-ACK / completed-handshake counts on each of A, B, C)
-2. IP breakdown aggregated across all 3 paths
-3. Confusion matrix (TP, FN, TN, FP) based on the chosen scenario's traffic counts
-4. Accuracy, precision, recall, F1
-
-### Pick the right traffic scenario at the prompt
-
-```
-  1.  run_all.py  —  20 attackers (h1-h10, h31-h40) | 40 legit (h11-h30, h41-h60)
-  2.  attacks.py  —  all 60 hosts attack
-  3.  flooding.py —  all 60 hosts flash crowd
-  4.  legit-traffic.py — all 60 hosts legit
-  5.  Single attack.py from h1 only
-  6.  Custom
-```
-
-### Confusion matrix definitions
-
-| Metric | Definition                                                |
-|--------|-----------------------------------------------------------|
-| TP     | Attack SYNs blocked by the switch (`total_attack − FN`)   |
-| FN     | Attack SYNs that reached h0 (summed across all 3 pcaps)   |
-| TN     | Legit SYNs that reached h0 (summed across all 3 pcaps)    |
-| FP     | Legit SYNs incorrectly blocked (`total_legit − TN`)       |
+Scenario 3 is the hardest (each detector sees only ~33% of an attacker's SYNs); the validated results above are on scenario 3.
 
 ---
 
 ## Key Design Decisions
 
-### 1. Full diamond, no s1↔s2 link
-Both splitters connect directly to every detector. Every detector is equidistant from every splitter — no shared backbone, no cross-splitter hop tax.
-
-### 2. Table-driven splitter
-The splitter P4 is compiled once. Different asymmetric-routing scenarios are realised purely by the controller filling `syn_split` / `ack_split` with different bucket→detector mappings. Reviewers cannot accuse you of compile-time tuning per experiment.
-
-### 3. Identical P4 on all 3 detectors
-A, B, and C run exactly the same `ddos_detector.p4`. The controller treats them identically. An attacker who somehow routes around one path is still blocked on the other two.
-
-### 4. Block rule pushed to ALL detectors
-When an attack is detected via any detector, the drop rule is installed on **A, B, and C**. This ensures the attacker is blocked regardless of which path their future packets take.
-
-### 5. Cumulative `ack_count` — never reset
-Mirrors what the symmetric single-switch CMS did in hardware (ACKs decrement). The formula `adjusted = max(0, cms_min − ack_count)` reconstructs the net unacknowledged SYN count in software. Resetting per-window would defeat the purpose.
-
-### 6. Source port excluded from CMS hash
-Flow key: `(src_ip, dst_ip, dst_port, protocol)` — no src_port. All connections from one host to one server port accumulate in a single bucket. 32 connections from the same attacker hit threshold, not 32 × N connections spread across N source ports.
-
-### 7. SYN-ACK excluded from decrement
-ACK decrement condition: `ACK=1 AND SYN=0`. SYN-ACK excluded — server SYN-ACK retransmits would otherwise collide with attacker CMS buckets and delay detection ~16×.
-
-### 8. Threshold = 32 (not 64)
-The P4M3 baseline used threshold 64 with a single detector seeing 100% of SYNs. In a multi-detector ECMP topology, each detector sees a fraction. Lowering to 32 compensates for SYN-fraction dilution. See `test.txt` section 12 for the full math.
-
-### 9. Evidence digest uses OR
-`c0 == 0 || c1 == 0` (not AND). In a real environment, CMS hash collisions can leave one row non-zero for an unrelated flow. OR ensures at least one clean row is enough to confirm asymmetric routing.
-
-### 10. h0 at `2001:1:1::100`, not `::10`
-`::10` is hex for 16, which collides with h16's natural address (`16 → 0x10`). h0 was moved out of the client range entirely.
-
-### 11. Triple pcap capture
-`server.py` starts `tcpdump` on **all 3** h0 interfaces (eth0 → A, eth1 → B, eth2 → C) before listening. `verify.py` reads all 3 and produces a per-path breakdown — the empirical proof that each scenario's split table is doing what it claims.
-
-### 12. Majority vote ensemble
-≥3/5 models must vote ATTACK. Individual model noise is suppressed. Legitimate flash crowd traffic (`adjusted ≈ 0`) votes 0/5. Attack traffic votes 4/5 or 5/5 at threshold rates.
+1. **Full diamond, no s1↔s2 link** — every detector equidistant from every splitter; no shared-backbone bias.
+2. **Table-driven splitter** — one compile, 10 scenarios chosen at runtime; no compile-time tuning per experiment.
+3. **Identical P4 on all detectors, block pushed to all three** — an attacker is blocked regardless of which path it uses next.
+4. **Source port excluded from the CMS key** — all of one host's connections accumulate in one counter (SYN-flood aggregation).
+5. **SYN-ACK excluded from the decrement** — avoids server retransmits colliding with attacker buckets and delaying detection.
+6. **Windowed counting (atomic snapshot-and-reset)** — features are scoped per evaluation and bounded, matching the model's training definition; no counting/reset race.
+7. **Reputation / hysteresis score** — never block on one window. A per-flow score (+1/−1, cap +3, block at −2) absorbs transient RTT-lagged windows and blocks only sustained attackers — this is what makes benign + flash reach 0% FP while every attacker down to 1 pps is still caught.
+8. **Threshold = 32 (not 64)** — compensates for per-detector SYN-fraction dilution under splits.
+9. **EVIDENCE digest uses OR (`c0==0 || c1==0`)** — one collision-free CMS row is enough to confirm asymmetric routing.
+10. **Real tools for evaluation** — ApacheBench for benign/flash, scapy for attack, so results reflect real behaviour.
 
 ---
 
-## Limitations & Math
+## Limitations & Future Work
 
-The detection floor under this design is bounded by the threshold and the SYN-split fraction. The exact formula:
-
-```
-FN_per_attacker  =  STRUCTURAL_FLOOR  +  LATENCY_PACKETS
-
-   STRUCTURAL_FLOOR  =  THRESHOLD / max(SYN_fraction_to_any_detector)
-   LATENCY_PACKETS   =  observed_pps × (digest_poll_s + grpc_install_s)
-                     ≈  14 × 1.2  ≈  17   (at 60-host scale with current config)
-
-Recall = 1 − (N_attackers × FN_per_attacker) / total_attack_sent
-```
-
-For scenario 3 (worst case — 33% max SYN fraction) at T=32:
-```
-FN/atk ≈ 32 / 0.34 + 17 ≈ 111
-Recall ≈ 1 − (60 × 111) / 120000 ≈ 94.5%
-```
-
-**BMv2 throughput is the binding constraint.** With 60 hosts running `attack.py` simultaneously, each splitter sees ~30,000 pps requested and saturates around 3–10 kpps. Each attacker's effective rate drops to ~14 pps. Attack runs take ~140 seconds instead of the designed ~4 seconds — this is BMv2/software-switch reality, not a bug. Recall is barely affected (the floor depends on SYN count, not speed); experiment runtime is heavily affected.
-
-For the full derivation, scenario-by-scenario recall projections, and the levers available to push recall higher (lower threshold further, parallelise gRPC pushes, etc.), see:
-
-- **`test.txt`** — section 12 has the full FN formula, projection tables for T=32 / T=16 / T=8, and the threshold change log
-- **`limitation.txt`** — full rationale for the 5000× ML multiplier, BMv2 throughput numbers, CMS memory math (8 KiB per detector)
+- **IP spoofing evades** — the CMS keys on source IP, so a randomised-source-IP flood never accumulates in one counter (`launch_v2.py MODE=spoof` / `attack_rate.py --spoof` demonstrate it). Aggregate destination-side detection (entropy / RST accounting) is the direction to close this.
+- **Random source port dilutes across the split** — the splitter hashes on `src_port`, so a random-port low-rate flood scatters across A/B/C and no single detector reaches its 32-SYN threshold (`attack_rate.py --rand-port`). The fix is **cross-detector SYN aggregation** at the controller (sum a flow's counts across all detectors instead of trusting one detector's per-bucket threshold).
+- **BMv2 throughput bounds runtime, not recall** — the single-threaded software switch sustains only a few kpps, so a flood designed to finish in seconds takes minutes; detection depends on SYN *count*, not speed, so recall is unaffected.
+- **Deferred:** full 10-scenario sweep with the lean+reputation pipeline, cross-detector aggregation, and a topology change from the diamond to a denser real-world topology. See `TODO.md`.
