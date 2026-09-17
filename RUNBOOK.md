@@ -77,6 +77,24 @@ The **lowest-rate source IP that gets blocked = your minimum detected pps.**
 
 ---
 
+## D) Partial-completion sweep — the completion-ratio boundary  (completion_test.py)
+**Run the controller on SCENARIO 1** (all SYNs→A, all ACKs→B — no split dilution,
+so the completion ratio is measured cleanly). Server (nginx) up. Then:
+```
+py exec(open('/home/ayush/my2/completion_test.py').read(), {'net': net, '__builtins__': __builtins__})
+```
+h1..h7 flood at 0 / 10 / 20 / 30 / 50 / 75 / 100 % completion — each host mixes
+real kernel HTTP connections (complete → ACK) with raw scapy SYNs (half-open).
+~200 attempts/host, a few seconds. Then:
+```
+python3 /home/ayush/my2/analyze_completion.py
+```
+It joins the IP→pct map (`/tmp/completion_map.csv`) with the eval dump and prints,
+per completion level, whether the host was blocked and the measured completion
+ratio — i.e. **how much real traffic an attacker must blend in to evade.**
+
+---
+
 ## Resetting between runs  (NO mininet/server restart needed)
 The switch keeps CMS counters and block rules across runs — that's why a
 second run looked "polluted". To get a clean slate:

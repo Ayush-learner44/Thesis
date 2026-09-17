@@ -105,6 +105,18 @@ paths) + server_nginx.py (does h0 IPv6+NDP setup, validates config,
 runs nginx foreground, optional pcaps, syn-recv monitor). Run it on h0 as the
 victim server. Requires `sudo apt install -y nginx`.
 
+## [KNOWN LIMITATION — documented, NOT to fix] Partial-completion (stealth) flood evades
+`completion_test.py` sweep (scenario 1, 0/10/20/30/50/75/100%): only the 0% pure
+flood is blocked; completing >=10% of handshakes evades (10% -> measured completion
+ratio ~0.30). Fundamental, not tunable: a 10% attacker's ratio (0.30) is HIGHER
+than a legit RTT-lagged benign window (0.06-0.14), so the classes overlap/invert
+on completion — no threshold separates them without new FPs. Retraining on partial
+samples would push the boundary into the lagged-benign region and trade FN for FP
+(decided NOT worth it). This is a half-open SYN-flood detector by design; a stealth
+flood blending a little real traffic needs an ORTHOGONAL signal (short-window SYN
+volume / destination-side entropy) — out of scope. Documented in README + weekly
+report as a stated limitation.
+
 ## [ ] (later) Cross-detector SYN aggregation to close the split-dilution evasion
 Splitter hashes on 5-tuple incl. src port (`traffic_splitter.p4:166`); detector CMS
 keys on 4-tuple (no src port). A random-source-port low-rate flood scatters across
