@@ -15,11 +15,17 @@ Switch roles:
 The active scenario is chosen at startup via an interactive prompt
 (same pattern as verify.py). The chosen scenario determines which
 entries the controller installs into the syn_split and ack_split
-tables on s1 and s2. Detection logic, ML ensemble, FlowTable, digest
-handlers — all UNCHANGED from the 2-detector version.
+tables on s1 and s2.
+
+Detection: at each THRESHOLD digest the controller computes six host-level
+features (syn_count, ack_count, unacked, completion_ratio, syn_rate_pps,
+duration_s) and feeds them to a single trained model (lean_model.pkl). The
+ack_count comes from EVIDENCE digests, so an ACK that took a different path is
+still counted (asymmetric-routing reconstruction). On an ATTACK verdict the
+drop rule is installed on all detector switches.
 """
 
-import os, sys, time, pickle, threading, logging, ipaddress
+import os, sys, time, pickle, threading, logging, ipaddress, subprocess
 import numpy as np
 
 sys.path.insert(0, '/home/ayush/p4-tools/p4-utils')
@@ -168,38 +174,24 @@ def _bytes_to_ipv6(raw):
 
 
 # ================================================================
-# ML ENSEMBLE  (unchanged from 2-detector version)
+# LEAN MODEL  (single model, 6 host-level features)
 # ================================================================
 
-class EnsembleClassifier:
-    def __init__(self, models_dir):
-        self.models = {}
-        self.scaler = None
-        log.info(f"Loading ML models from {models_dir}/")
-        for name, fname in [('knn', 'knn_model.pkl'), ('rf',  'rf_model.pkl'),
-                             ('dt',  'dt_model.pkl'),  ('xgb', 'xgb_model.pkl'),
-                             ('svm', 'svm_model.pkl')]:
-            path = os.path.join(models_dir, fname)
-            if os.path.exists(path):
-                with open(path, 'rb') as f:
-                    self.models[name] = pickle.load(f)
-                log.info(f"  Loaded: {name}")
-            else:
-                log.warning(f"  Missing: {path}")
-        scaler_path = os.path.join(models_dir, 'scaler.pkl')
-        if os.path.exists(scaler_path):
-            with open(scaler_path, 'rb') as f:
-                self.scaler = pickle.load(f)
-        log.info(f"Ensemble ready: {len(self.models)} models loaded")
+class LeanModel:
+    """Loads the lean model + its feature order. Predicts on the 6 features
+    the controller computes at THRESHOLD time (no window, no 5000x hack)."""
 
-    def predict(self, pps):
-        pps_scaled = pps * 5000.0
-        features = np.array([[pps_scaled]])
-        if self.scaler:
-            features = self.scaler.transform(features)
-        votes = sum(1 for m in self.models.values() if m.predict(features)[0] == 1)
-        total = len(self.models)
-        return votes > (total / 2), votes, total
+    def __init__(self, models_dir):
+        with open(os.path.join(models_dir, 'lean_model.pkl'), 'rb') as f:
+            self.model = pickle.load(f)
+        with open(os.path.join(models_dir, 'lean_feature_order.pkl'), 'rb') as f:
+            self.feature_order = pickle.load(f)
+        log.info(f"Lean model loaded; features (in order): {self.feature_order}")
+
+    def predict(self, feats):
+        """feats: dict of feature_name -> value. Returns True if ATTACK."""
+        x = np.array([[float(feats[f]) for f in self.feature_order]])
+        return int(self.model.predict(x)[0]) == 1
 
 
 # ================================================================
@@ -247,7 +239,7 @@ class DDoSController:
         name, self.syn_ranges, self.ack_ranges = SCENARIOS[scenario_id]
         self.scenario_name = name
 
-        self.ensemble    = EnsembleClassifier(MODELS_DIR)
+        self.model       = LeanModel(MODELS_DIR)
         self.flow_table  = FlowTable()
         self.switches    = {}
         self.blocked_ips = set()
@@ -257,6 +249,7 @@ class DDoSController:
 
         self.topo = load_topo(TOPO_PATH)
         self._connect_switches()
+        self._reset_switch_state()          # wipe old CMS counts + block rules
         self._install_forwarding_rules()
         self._install_split_rules()
         self._enable_digests()
@@ -291,6 +284,43 @@ class DDoSController:
                 log.info(f"  Connected: {sw} [{role}] (device_id={device_id} grpc={grpc_port})")
             except Exception as e:
                 log.error(f"  Failed to connect {sw}: {e}")
+
+    # detector thrift ports (simple_switch_grpc also runs a thrift server here)
+    _THRIFT_FALLBACK = {'A': 9092, 'B': 9093, 'C': 9094}
+
+    def _reset_switch_state(self):
+        """Make every controller (re)start a CLEAN slate WITHOUT restarting
+        mininet or the switches:
+          * clear the block table (dangerous_table) via P4Runtime, and
+          * zero the CMS registers (cms_row0/1) via the switch's thrift CLI.
+        Run once at startup, on the 3 detectors only (splitters have neither)."""
+        for sw, api in self.switches.items():
+            if sw in SPLITTER_SWITCHES:
+                continue
+            # 1) drop all previously-installed block rules
+            try:
+                api.table_clear('MyIngress.dangerous_table')
+            except Exception as e:
+                if 'no entries' not in str(e).lower():
+                    log.warning(f"  {sw} dangerous_table clear: {e}")
+            # 2) zero the CMS counters over thrift
+            try:
+                tport = self.topo.get_thrift_port(sw)
+            except Exception:
+                tport = self._THRIFT_FALLBACK.get(sw)
+            if not tport:
+                log.warning(f"  {sw}: no thrift port, CMS not reset")
+                continue
+            cmds = "register_reset MyIngress.cms_row0\nregister_reset MyIngress.cms_row1\n"
+            try:
+                subprocess.run(['simple_switch_CLI', '--thrift-port', str(tport)],
+                               input=cmds, capture_output=True, text=True, timeout=15)
+                log.info(f"  {sw}: CMS registers reset + block rules cleared (thrift {tport})")
+            except FileNotFoundError:
+                log.warning("  simple_switch_CLI not on PATH — CMS not reset "
+                            "(restart mininet for a clean CMS)")
+            except Exception as e:
+                log.warning(f"  {sw} CMS reset: {e}")
 
     def _install_forwarding_rules(self):
         for sw, port_map in PORT_MAPS.items():
@@ -450,40 +480,53 @@ class DDoSController:
         if start_time is None:
             start_time = timestamp - 1_000_000
 
-        ack_count     = self.flow_table.get_ack(flow_key)
-        adjusted      = max(0, cms_min - ack_count)
-        elapsed       = max(0.001, (timestamp - start_time) / 1_000_000.0)
-        pps           = adjusted / elapsed
+        # ---- compute the 6 lean features at THRESHOLD time (cumulative) ----
+        #   cms_min       = SYNs seen for this flow (net of any local ACK decrement)
+        #   ack_count     = ACKs reconstructed globally from EVIDENCE digests
+        #                   (this is the asymmetric-routing reconstruction: an ACK
+        #                    that took a different path is counted here)
+        syn_count        = cms_min
+        ack_count        = self.flow_table.get_ack(flow_key)
+        unacked          = max(0, syn_count - ack_count)
+        completion_ratio = (ack_count / syn_count) if syn_count > 0 else 0.0
+        elapsed          = max(0.001, (timestamp - start_time) / 1_000_000.0)
+        syn_rate_pps     = syn_count / elapsed
+        duration_s       = elapsed
 
-        is_attack, votes, total = self.ensemble.predict(pps)
+        feats = {
+            'syn_count':        syn_count,
+            'ack_count':        ack_count,
+            'unacked':          unacked,
+            'completion_ratio': completion_ratio,
+            'syn_rate_pps':     syn_rate_pps,
+            'duration_s':       duration_s,
+        }
+        is_attack = self.model.predict(feats)
 
         log.info(f"THRESHOLD   [{sw_name}]  {src_ip} -> :{dst_port}  "
-                 f"cms_min={cms_min}  ack_count={ack_count}  adjusted={adjusted}  "
-                 f"elapsed={elapsed:.3f}s  pps={pps:.1f}  pps_scaled={pps*5000:.0f}  vote={votes}/{total}")
+                 f"syn={syn_count} ack={ack_count} unacked={unacked} "
+                 f"compl={completion_ratio:.2f} pps={syn_rate_pps:.1f} dur={duration_s:.2f}s "
+                 f"-> {'ATTACK' if is_attack else 'BENIGN'}")
 
         if is_attack:
+            # atomic check-and-reserve: if two detectors flag the same attacker
+            # at once, only the FIRST thread past this lock pushes the rule.
+            with self._lock:
+                if src_ip in self.blocked_ips:
+                    return                       # already handled by another thread
+                self.blocked_ips.add(src_ip)     # reserve now, inside the lock
+                self.stats['attacks'] += 1
             log.warning(
                 f"\n{'─'*48}\n"
                 f"  ATTACK DETECTED\n"
-                f"  src        : {src_ip}  (via {sw_name})\n"
-                f"  cms_min    : {cms_min}   ack_count  : {ack_count}   adjusted : {adjusted}\n"
-                f"  pps        : {pps:.1f}   pps_scaled : {pps*5000:.0f}   vote : {votes}/{total}\n"
-                f"  action     : drop rule installed on ALL detector switches\n"
+                f"  src     : {src_ip}  (via {sw_name})\n"
+                f"  syn={syn_count} ack={ack_count} unacked={unacked} "
+                f"completion_ratio={completion_ratio:.2f}\n"
+                f"  action  : drop rule installed on ALL detector switches\n"
                 f"{'─'*48}"
             )
-            with self._lock:
-                self.blocked_ips.add(src_ip)
-                self.stats['attacks'] += 1
             self._push_block_rule(src_ip)
         else:
-            log.info(
-                f"\n{'─'*48}\n"
-                f"  BENIGN\n"
-                f"  src        : {src_ip}  (via {sw_name})\n"
-                f"  cms_min    : {cms_min}   ack_count  : {ack_count}   adjusted : {adjusted}\n"
-                f"  pps        : {pps:.1f}   pps_scaled : {pps*5000:.0f}   vote : {votes}/{total}\n"
-                f"{'─'*48}"
-            )
             with self._lock:
                 self.stats['benign'] += 1
 
@@ -555,7 +598,7 @@ class DDoSController:
         log.info(f"  ACK ranges        : {self.ack_ranges}")
         log.info("  Digests : first_seen | threshold | evidence (all 3 on each detector)")
         log.info("  Blocking: dangerous_table pushed to ALL detector switches")
-        log.info("  pps formula: max(0, cms_min - ack_count) / elapsed_total")
+        log.info(f"  Model   : lean_model.pkl  features={self.model.feature_order}")
         log.info("=" * 60)
 
         try:
