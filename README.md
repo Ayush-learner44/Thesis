@@ -2,8 +2,9 @@
 
 A P4/BMv2 testbed that detects and blocks TCP SYN-flood DDoS **inside a
 datacenter fabric**, where no single switch ever sees a whole flow. The edge
-switches spray packets per-packet across their uplinks, so a connection's SYNs
-and ACKs take different paths up and are seen by different aggregation switches.
+switches **flowlet-spray** across their uplinks, so a connection's SYN and its ACK
+(a round-trip apart) take different paths up and are seen by different aggregation
+switches — while packets within a burst keep one path so TCP stays in order.
 Each aggregation switch runs a lightweight Count-Min-Sketch detector; a central
 controller reconstructs each flow across detectors, scores it, and blocks
 attackers fabric-wide.
@@ -18,7 +19,7 @@ attackers fabric-wide.
 |------|-------|------|
 | Core | 4 (`c00 c01 c10 c11`) | dumb down-forwarder |
 | Aggregation | 8 (`a00 … a31`) | **smart CMS detector** |
-| Edge | 8 (`e00 … e31`) | dumb forwarder + **per-packet uplink spray** |
+| Edge | 8 (`e00 … e31`) | dumb forwarder + **flowlet uplink spray** |
 | Hosts | 32 (4 per edge) | 8 servers + 24 clients |
 
 - **Servers** = every host in **pod 2** (a dedicated server pod): `h17 h18 h19 h20
@@ -33,8 +34,9 @@ attackers fabric-wide.
 ## Why it's hard (the crux)
 
 Real routing keeps a connection's 5-tuple together, so one switch sees both the
-SYN and the ACK. Per-packet spray breaks that: `a00` might see the SYNs while
-`a13` sees the completing ACKs. A per-switch "SYNs without ACKs" heuristic then
+SYN and the ACK. Flowlet spray breaks that: the SYN and its ACK fall in different
+flowlets, so `a00` sees the SYNs while `a13` sees the completing ACKs. A
+per-switch "SYNs without ACKs" heuristic then
 false-alarms on healthy traffic. The controller solves this by keying flows on
 `(src, dst, dport, proto)` and **summing evidence across all detectors** before
 it decides.
@@ -53,18 +55,23 @@ it decides.
    window never blocks, but a real attacker (every window bad) is blocked after a
    couple of windows, on **every** detector at once.
 
-## Validated results (k=4 fat-tree)
+## Validated results (k=4 fat-tree, 24 clients → 8 servers)
 
-| Scenario | Traffic | Outcome |
-|----------|---------|---------|
-| `attack` | scapy SYN flood, all clients | **8/8 attackers blocked** |
-| `benign` | steady `ab`, all clients | 0 false positives |
-| `flash`  | heavy `ab` burst, all clients | 0 false positives (score absorbs spray lag) |
-| `mixed`  | half flood + half benign | attackers blocked, benign served, 0 FP |
-| `lrddos` | pps ladder 1…100 | detected down to the lowest rate |
+| Scenario | Traffic | Result |
+|----------|---------|--------|
+| `attack` | 24 clients, scapy SYN flood | **24/24 attackers blocked**, 0 FP |
+| `benign` | 24 clients, `ab -c 5` | 24/24 served, **0 FP** |
+| `flash`  | 24 clients, `ab -c 40 -n 200` | 24/24 served, **0 FP** |
+| `mixed`  | 12 attack + 12 benign | 12/12 blocked, 12/12 served, **0 FP** |
+| `lrddos` | 24 clients, 1…100 pps ladder | detected down to the lowest rate |
 
-Verified server-side from pcaps: attackers blocked, benign requests served,
-attack SYNs leaked only in the pre-block window.
+**Recall 100%, FPR 0%.** The edge uses **flowlet spray**, so a heavy legit burst
+keeps TCP in order and completes. At block-score `-2`, the flash 0-FP result holds
+up to **`ab -c 40 -n 200`** (the operating point); at `-c 45` one benign flow slips
+(1 FP), and heavier flash needs a more forgiving block score. Verified server-side
+from pcaps (attackers blocked, benign served, attack SYNs leaked only pre-block).
+
+See **[RUNBOOK.md](RUNBOOK.md)** for step-by-step run instructions.
 
 ## Layout
 
