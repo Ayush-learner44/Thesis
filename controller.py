@@ -43,15 +43,35 @@ class LeanModel:
         return int(self.model.predict(np.array([[float(f[k]) for k in self.order]]))[0]) == 1
 
 
+class Reporter:
+    """Single home for real-time console output (timestamped, coloured, aligned).
+    Detection logic only calls seen()/vote()/block()/mark(); formatting lives here."""
+    _C = dict(t='\033[2m', SEEN='\033[36m', BENIGN='\033[32m', ATTACK='\033[33m',
+              BLOCK='\033[1;31m', mark='\033[1;35m', z='\033[0m')
+    def _stamp(self): return f"{self._C['t']}{time.strftime('%H:%M:%S')}{self._C['z']}"
+    def seen(self, ip, port):
+        print(f"{self._stamp()} {self._C['SEEN']}SEEN {self._C['z']} {ip:<22} :{port}  new flow", flush=True)
+    def vote(self, ip, verdict, score, compl, syn, ack):
+        c = self._C[verdict]
+        print(f"{self._stamp()} {c}VOTE {verdict:<6}{self._C['z']} {ip:<22} "
+              f"score={score:+d} compl={compl:.2f} syn={syn} ack={ack}", flush=True)
+    def block(self, ip, score):
+        print(f"{self._stamp()} {self._C['BLOCK']}BLOCK{self._C['z']} {ip:<22} "
+              f"score={score} -> dropped on all detectors", flush=True)
+    def mark(self, text):
+        print(f"{self._stamp()} {self._C['mark']}── {text} ──{self._C['z']}", flush=True)
+
+
 class FlowTable:
     """Per-flow state: [first_seen, ack_count, last_eval, last_cms_syn, score]."""
     def __init__(self, cap=100_000):
         self.t, self.lock, self.cap = {}, threading.Lock(), cap
-    def record(self, fk, ts):                                   # note a new flow once
+    def record(self, fk, ts):                                   # note a new flow once; True if new
         with self.lock:
-            if fk in self.t: return
+            if fk in self.t: return False
             if len(self.t) >= self.cap: del self.t[next(iter(self.t))]
             self.t[fk] = [ts, 0, ts, 0, 0]
+            return True
     def add_ack(self, fk):                                      # EVIDENCE -> +1 windowed ack
         with self.lock:
             if fk in self.t: self.t[fk][1] += 1
@@ -71,6 +91,8 @@ class Controller:
     def __init__(self):
         self.model = LeanModel(MODELS_DIR)
         self.flows = FlowTable()
+        self.report = Reporter()
+        self._last_evt = 0.0                                    # ts of last digest (activity monitor)
         self.sw = {}
         self.blocked = set()
         self.stats = dict(first_seen=0, threshold=0, evidence=0, benign=0, suspicious=0, blocked=0)
@@ -131,9 +153,10 @@ class Controller:
 
     # ---- digest handlers ----
     def _first_seen(self, m, s):
-        self.flows.record((_ip6(m[0].bitstring), _ip6(m[1].bitstring),
-                           int.from_bytes(m[2].bitstring, 'big'), int.from_bytes(m[3].bitstring, 'big')),
-                          int.from_bytes(m[4].bitstring, 'big'))
+        fk = (_ip6(m[0].bitstring), _ip6(m[1].bitstring),
+              int.from_bytes(m[2].bitstring, 'big'), int.from_bytes(m[3].bitstring, 'big'))
+        if self.flows.record(fk, int.from_bytes(m[4].bitstring, 'big')):
+            self.report.seen(fk[0], fk[2])                      # print once per new flow
         with self.lock: self.stats['first_seen'] += 1
 
     def _evidence(self, m, s):
@@ -159,6 +182,7 @@ class Controller:
         attack = self.model.predict(feats)
         score = self.flows.bump(fk, -PENALTY if attack else REWARD)
         do_block = score <= BLOCK_SCORE
+        self.report.vote(src, 'ATTACK' if attack else 'BENIGN', score, compl, syn, ack)
         self.csv.write(f"{ts},{s},{src},{port},{syn},{ack},{unacked},{compl:.4f},"
                        f"{syn/elapsed:.2f},{elapsed:.4f},{'ATTACK' if attack else 'BENIGN'},"
                        f"{score},{'BLOCK' if do_block else ''}\n"); self.csv.flush()
@@ -166,7 +190,7 @@ class Controller:
             with self.lock:
                 if src in self.blocked: return
                 self.blocked.add(src); self.stats['blocked'] += 1
-            log.info(f"BLOCK {src} (score {score}) via {s}")
+            self.report.block(src, score)
             self._block(src)
         else:
             with self.lock:
@@ -179,6 +203,7 @@ class Controller:
             try:
                 dl = api.get_digest_list(timeout=1)
                 if dl is None: continue
+                self._last_evt = time.time()                    # feed the activity monitor
                 for d in dl.data:
                     m = d.struct.members
                     (self._evidence if len(m) == 4 else self._first_seen if len(m) == 5
@@ -186,10 +211,22 @@ class Controller:
             except Exception as e:
                 if 'timeout' not in str(e).lower(): log.error(f"digest {s}: {e}")
 
+    def _monitor(self):                                        # print traffic START/IDLE transitions
+        active = False
+        while True:
+            time.sleep(1)
+            idle = time.time() - self._last_evt
+            if not active and idle < 1.5:
+                active = True; self.report.mark('traffic START (digests arriving)')
+            elif active and idle >= 3:
+                active = False; self.report.mark('traffic IDLE — launch stopped')
+
     def start(self):
         for s in ft.AGGS:
             threading.Thread(target=self._recv, args=(s,), daemon=True).start()
+        threading.Thread(target=self._monitor, daemon=True).start()
         log.info(f"CLOS controller RUNNING  detectors={ft.AGGS}")
+        self.report.mark('controller RUNNING — waiting for traffic')
         try:
             while True:
                 time.sleep(10)

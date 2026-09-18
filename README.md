@@ -21,8 +21,9 @@ attackers fabric-wide.
 | Edge | 8 (`e00 … e31`) | dumb forwarder + **per-packet uplink spray** |
 | Hosts | 32 (4 per edge) | 8 servers + 24 clients |
 
-- **Servers** = the last host of each edge: `h4 h8 h12 h16 h20 h24 h28 h32`
-  (one per edge). Every other host is a client.
+- **Servers** = every host in **pod 2** (a dedicated server pod): `h17 h18 h19 h20
+  h21 h22 h23 h24`. Every host in pods 0/1/3 is a client. Traffic is round-robined
+  evenly across the 8 servers, so every flow is **cross-pod** (always sprayed).
 - Addressing: `hN = 2001:1:1::N` (N in hex). IPv6 throughout.
 - 64 links. Down-routing is fixed by destination; **up-routing is a free
   choice**, and the edge sprays it — that spray is the only thing that makes a

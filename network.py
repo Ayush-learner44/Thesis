@@ -48,8 +48,8 @@ for srv in ft.SERVERS:                                 # auto-start nginx+pcap o
     mn.get(srv).cmd(f'python3 {HERE}/server.py > {TMP}/srv_{srv}.log 2>&1 &')
 print(f"[net] {len(ft.HOSTS)} hosts configured; servers running: {ft.SERVERS}")
 
-print("\n\033[1;36m CLOS fat-tree up (20 switches, 32 hosts, 8 servers h4..h32)."
+print("\n\033[1;36m CLOS fat-tree up (20 switches, 32 hosts, 8 servers h17..h24 = pod 2)."
       "\n  controller : python3 controller.py"
       "\n  traffic    : py exec(open('launch.py').read())"
-      "\n  watch a srv: xterm h8  ->  tail -f tmp/srv_h8.log\033[0m\n")
+      "\n  watch a srv: xterm h20  ->  tail -f tmp/srv_h20.log\033[0m\n")
 CLI(mn); net.stopNetwork()

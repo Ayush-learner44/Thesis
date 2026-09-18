@@ -1,11 +1,13 @@
 """k=4 fat-tree topology + routing. Single source of truth.
 
 20 switches (4 core, 8 aggregation=detectors, 8 edge), 8 edges x 4 hosts = 32
-hosts. Last host on each edge is a SERVER (h4,h8,...,h32); the other 3 are clients.
+hosts. All hosts of one pod (SERVER_POD, default pod 2 = h17..h24) are SERVERS; every
+other host is a client, so every client->server flow is cross-pod (always sprayed).
 Up-path is sprayed at the edge; down-path is fixed by destination.
 """
 
 K, HALF, HOSTS_PER_EDGE = 4, 2, 4          # arity, k/2, hosts per edge
+SERVER_POD = 2                             # this whole pod is the server farm; rest = clients
 
 def core(i, j): return f'c{i}{j}'
 def agg(p, a):  return f'a{p}{a}'
@@ -27,19 +29,19 @@ for eidx, esw in enumerate(EDGES):
             mac=f'aa:00:00:00:00:{hid:02x}',
             ipv6=f'2001:1:1::{hid:x}',
             pod=eidx // HALF, edge_sw=esw, edge_idx=eidx % HALF,
-            role='server' if pos == HOSTS_PER_EDGE - 1 else 'client',
+            role='server' if eidx // HALF == SERVER_POD else 'client',
             down_port=1 + pos,                                   # edge host ports 1..4
         ))
 
-SERVERS = [h['name'] for h in HOSTS if h['role'] == 'server']    # h4,h8,...,h32
+SERVERS = [h['name'] for h in HOSTS if h['role'] == 'server']    # pod 2: h17..h24
 CLIENTS = [h['name'] for h in HOSTS if h['role'] == 'client']
 HOST_BY_NAME = {h['name']: h for h in HOSTS}
 
-# each client targets the server on the NEXT edge -> always cross-edge, so traffic
-# climbs through the aggregations and gets sprayed (never a local shortcut).
-_srv_of_edge = {EDGES.index(h['edge_sw']): h for h in HOSTS if h['role'] == 'server'}
-TARGET = {h['name']: _srv_of_edge[(EDGES.index(h['edge_sw']) + 1) % len(EDGES)]['ipv6']
-          for h in HOSTS if h['role'] == 'client'}
+# client -> target server IP: round-robin across the server pod, shared evenly over
+# all 8 servers. every client lives in another pod, so every flow is cross-pod (up to
+# a core and back down) -> always climbs an aggregation detector and gets sprayed.
+TARGET = {name: HOST_BY_NAME[SERVERS[i % len(SERVERS)]]['ipv6']
+          for i, name in enumerate(CLIENTS)}
 
 # ---- links: (sw1, port1, sw2, port2) ----------------------------------------
 # edge ports: 1..4 hosts (down), 5..6 aggs (up) | agg: 1..2 edges, 3..4 cores | core: 1..4 pods

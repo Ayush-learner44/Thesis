@@ -1,6 +1,6 @@
 """Traffic launcher. Run from the mininet prompt (cwd = my2):
       py exec(open('launch.py').read())
-All 24 CLIENTS generate traffic to their cross-edge target server. Set MODE below.
+All 24 CLIENTS generate traffic to their round-robin (cross-pod) server. Set MODE below.
 Writes tmp/run_roles.csv (src_ip,role) for verify.py.
 (No net-referencing functions here, so the short `py exec(...)` form works.)
 """
@@ -9,7 +9,7 @@ sys.path.insert(0, '/home/ayush/my2/lib')
 import fattree as ft
 
 # ---- choose scenario ----
-MODE = 'benign'          # benign | flash | attack | mixed | lrddos
+MODE = 'flash'          # benign | flash | attack | mixed | lrddos
 DUR  = 3                 # attack flood seconds
 # -------------------------
 
@@ -25,7 +25,7 @@ for i, h in enumerate(ft.CLIENTS):
     if MODE == 'benign':
         net.get(h).cmd(f'ab -r -n 100 -c 5 http://[{tgt}]:80/ >{TMP}/ab_{h}.log 2>&1 &'); roles[h] = 'benign'
     elif MODE == 'flash':
-        net.get(h).cmd(f'ab -r -n 150 -c 40 http://[{tgt}]:80/ >{TMP}/ab_{h}.log 2>&1 &'); roles[h] = 'benign'
+        net.get(h).cmd(f'ab -r -n 500 -c 100 http://[{tgt}]:80/ >{TMP}/ab_{h}.log 2>&1 &'); roles[h] = 'benign'
     elif MODE == 'attack':
         net.get(h).cmd(f'python3 {ATK} {tgt} {DUR} >{TMP}/atk_{h}.log 2>&1 &'); roles[h] = 'attacker'
     elif MODE == 'mixed':

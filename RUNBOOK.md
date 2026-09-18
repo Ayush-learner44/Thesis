@@ -6,8 +6,8 @@ different upward paths (edge per-packet spray) but reach the same server
 the controller reconstructs. Hosts and servers auto-configure at boot.
 
 **20 switches** (4 core, 8 aggregation = detectors, 8 edge = spray) · **32 hosts**
-(4 per edge) · **8 servers** = the last host of each edge: `h4 h8 h12 h16 h20 h24 h28 h32`
-(IPs `::4 ::8 …`). The other 24 hosts are clients. `hN = 2001:1:1::N` (hex).
+(4 per edge) · **8 servers** = every host in **pod 2**: `h17 h18 h19 h20 h21 h22 h23 h24`
+(IPs `::11 ::12 … ::18`). The other 24 hosts (pods 0/1/3) are clients. `hN = 2001:1:1::N` (hex).
 
 ## Files
 | File | Role |
@@ -42,7 +42,7 @@ cd /home/ayush/my2 && python3 controller.py
 
 **3) Verify forwarding:**
 ```
-mininet> h1 ping6 -c2 2001:1:1::8      # 0% loss (h1 -> a server, cross-edge)
+mininet> h1 ping6 -c2 2001:1:1::11     # 0% loss (h1 -> h17, a pod-2 server, cross-pod)
 ```
 
 **4) Traffic** — set `MODE` in `launch.py`, then (short form — run from the
@@ -65,11 +65,11 @@ python3 /home/ayush/my2/lib/verify.py
 → attackers blocked (recall), attack SYNs leaked pre-block, benign served, benign FP.
 
 ## Watch a server live (for a reviewer)
-Each server's nginx access log streams to `/tmp/srv_<host>.log`:
+Each server's nginx access log streams to `tmp/srv_<host>.log` (project tmp/):
 ```
-mininet> xterm h8
-#   in the xterm:
-tail -f /tmp/srv_h8.log     # each request: "<client ip> -> 200 (GET / HTTP/1.0)"
+mininet> xterm h20
+#   in the xterm (cwd = my2):
+tail -f tmp/srv_h20.log     # each request: "<client ip> -> 200 (GET / HTTP/1.0)"
 ```
 
 ## Reset between runs
