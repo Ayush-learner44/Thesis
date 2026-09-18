@@ -25,7 +25,7 @@ for i, h in enumerate(ft.CLIENTS):
     if MODE == 'benign':
         net.get(h).cmd(f'ab -r -n 100 -c 5 http://[{tgt}]:80/ >{TMP}/ab_{h}.log 2>&1 &'); roles[h] = 'benign'
     elif MODE == 'flash':
-        net.get(h).cmd(f'ab -r -n 500 -c 100 http://[{tgt}]:80/ >{TMP}/ab_{h}.log 2>&1 &'); roles[h] = 'benign'
+        net.get(h).cmd(f'ab -r -n 200 -c 80 http://[{tgt}]:80/ >{TMP}/ab_{h}.log 2>&1 &'); roles[h] = 'benign'
     elif MODE == 'attack':
         net.get(h).cmd(f'python3 {ATK} {tgt} {DUR} >{TMP}/atk_{h}.log 2>&1 &'); roles[h] = 'attacker'
     elif MODE == 'mixed':

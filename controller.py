@@ -218,7 +218,7 @@ class Controller:
             idle = time.time() - self._last_evt
             if not active and idle < 1.5:
                 active = True; self.report.mark('traffic START (digests arriving)')
-            elif active and idle >= 3:
+            elif active and idle >= 6:                         # 6s so bursty traffic doesn't flap
                 active = False; self.report.mark('traffic IDLE — launch stopped')
 
     def start(self):
