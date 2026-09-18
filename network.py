@@ -1,130 +1,55 @@
+"""Boot the k=4 fat-tree (20 switches, 32 hosts, 8 servers) and auto-configure it.
+Run:  sudo python3 network.py     then in another terminal:  python3 controller.py
+"""
+import os, sys
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(HERE, 'lib'))
+import fattree as ft
 from p4utils.mininetlib.network_API import NetworkAPI
+from mininet.cli import CLI
 
-net = NetworkAPI()
-net.setLogLevel('info')
+net = NetworkAPI(); net.setLogLevel('info')
+P4 = {'core': 'p4src/ft_core.p4', 'agg': 'p4src/ddos_detector.p4', 'edge': 'p4src/ft_edge.p4'}
+role = lambda sw: 'core' if sw in ft.CORES else ('agg' if sw in ft.AGGS else 'edge')
 
-# ================================================================
-# FULL DIAMOND TOPOLOGY  (2 splitters × 3 detectors × 60 hosts)
-#
-#   h1..h30 ──── s1 ──┐ ┌── A ──┐
-#                     ├─┤── B ──┤── h0 (3 NICs, same MAC)
-#   h31..h60 ─── s2 ──┘ └── C ──┘
-#
-# s1 ports:  1..30 = h1..h30           31=A, 32=B, 33=C
-# s2 ports:  1..30 = h31..h60          31=A, 32=B, 33=C
-# A  ports:  1=s1, 2=s2, 3=h0-eth0
-# B  ports:  1=s1, 2=s2, 3=h0-eth1
-# C  ports:  1=s1, 2=s2, 3=h0-eth2
-#
-# No s1↔s2 link — each detector is equidistant from each splitter.
-# h0 has the SAME MAC on all 3 interfaces; IPv6 is assigned only
-# on eth0 (the A path). Linux weak-host model accepts packets on
-# eth1 and eth2 as well.
-# ================================================================
-
-# ── Switches ────────────────────────────────────────────────────
-net.addP4RuntimeSwitch('s1')
-net.addP4RuntimeSwitch('s2')
-net.addP4RuntimeSwitch('A')
-net.addP4RuntimeSwitch('B')
-net.addP4RuntimeSwitch('C')
-
-net.setP4Source('s1', 'p4src/traffic_splitter.p4')
-net.setP4Source('s2', 'p4src/traffic_splitter.p4')
-net.setP4Source('A',  'p4src/ddos_detector.p4')
-net.setP4Source('B',  'p4src/ddos_detector.p4')
-net.setP4Source('C',  'p4src/ddos_detector.p4')
+switches = ft.CORES + ft.AGGS + ft.EDGES
+for sw in switches:                                    # add + program every switch
+    net.addP4RuntimeSwitch(sw); net.setP4Source(sw, P4[role(sw)])
 net.setCompiler(p4rt=True)
 
-# ── Hosts ───────────────────────────────────────────────────────
-net.addHost('h0')
-for i in range(1, 61):
-    net.addHost(f'h{i}')
+for h in ft.HOSTS:                                     # hosts
+    net.addHost(h['name'])
+for (s1, p1, s2, p2) in ft.LINKS:                      # links
+    net.addLink(s1, s2, port1=p1, port2=p2)
+for h in ft.HOSTS:                                     # MAC + IPv6 per host
+    net.setIntfMac(h['name'], h['edge_sw'], h['mac'])
+    net.setIntfIp(h['name'], h['edge_sw'], h['ipv6'] + '/64')
 
-# ── Links — hosts to splitters ──────────────────────────────────
-for i in range(1, 31):
-    net.addLink('s1', f'h{i}', port1=i, port2=0)
-for i in range(31, 61):
-    net.addLink('s2', f'h{i}', port1=i - 30, port2=0)
+net.disableArpTables(); net.disableGwArp()
+for i, sw in enumerate(switches):                      # gRPC + thrift ports
+    net.setThriftPort(sw, 9090 + i); net.setGrpcPort(sw, 9560 + i)
 
-# ── Links — splitters to detectors (full diamond) ───────────────
-net.addLink('s1', 'A', port1=31, port2=1)
-net.addLink('s1', 'B', port1=32, port2=1)
-net.addLink('s1', 'C', port1=33, port2=1)
-net.addLink('s2', 'A', port1=31, port2=2)
-net.addLink('s2', 'B', port1=32, port2=2)
-net.addLink('s2', 'C', port1=33, port2=2)
-
-# ── Links — detectors to h0 (3 NICs) ────────────────────────────
-net.addLink('A', 'h0', port1=3, port2=0)
-net.addLink('B', 'h0', port1=3, port2=1)
-net.addLink('C', 'h0', port1=3, port2=2)
-
-# ── Client MACs (h1..h60) ───────────────────────────────────────
-for i in range(1, 61):
-    mac = f'aa:00:00:00:00:{i:02x}'
-    sw  = 's1' if i <= 30 else 's2'
-    net.setIntfMac(f'h{i}', sw, mac)
-
-# ── h0 MAC — same on all 3 interfaces (weak host model) ─────────
-net.setIntfMac('h0', 'A', 'aa:00:00:00:00:00')
-net.setIntfMac('h0', 'B', 'aa:00:00:00:00:00')
-net.setIntfMac('h0', 'C', 'aa:00:00:00:00:00')
-
-# ── Client IPv6 addresses ───────────────────────────────────────
-for i in range(1, 61):
-    ipv6 = f'2001:1:1::{i:x}/64'
-    sw   = 's1' if i <= 30 else 's2'
-    net.setIntfIp(f'h{i}', sw, ipv6)
-
-# ── h0 IPv6 — only on the A interface ───────────────────────────
-# h0 uses ::100 (NOT ::10) to avoid collision with h16's natural address
-# (0x10 = 16 = h16). Clients h1..h60 use ::1..::3c.
-net.setIntfIp('h0', 'A', '2001:1:1::100/64')
-
-# ── No ARP / NDP — static neighbor entries handled by scripts ───
-net.disableArpTables()
-net.disableGwArp()
-
-# ── gRPC + Thrift ports per switch ──────────────────────────────
-net.setThriftPort('s1', 9090); net.setGrpcPort('s1', 9559)
-net.setThriftPort('s2', 9091); net.setGrpcPort('s2', 9560)
-net.setThriftPort('A',  9092); net.setGrpcPort('A',  9561)
-net.setThriftPort('B',  9093); net.setGrpcPort('B',  9562)
-net.setThriftPort('C',  9094); net.setGrpcPort('C',  9563)
-
-net.enableCli()
-
-print("""
-\033[1;36m
-================================================================
-  EXPERIMENT QUICK REFERENCE  (scroll up if buried)
-================================================================
-
-  STEP 1 — MININET is up (this terminal)
-
-  STEP 2 — CONTROLLER  (separate Linux terminal):
-    cd /home/ayush/my2/controller
-    python3 controller.py
-    → Pick scenario [1-10] at the prompt
-
-  STEP 3 — SERVER  (open h0 xterm, run before traffic):
-    xterm h0
-    python3 /home/ayush/my2/server_nginx.py     # nginx over IPv6
-
-  STEP 4 — TRAFFIC  (set MODE in launch_v2.py, then paste into mininet CLI):
-
-    benign / flash / attack / spoof / mixed
-      py exec(open('/home/ayush/my2/launch_v2.py').read(), {'net': net, '__builtins__': __builtins__})
-
-    low-rate DDoS sweep (find minimum detected pps)
-      py exec(open('/home/ayush/my2/lrddos_sweep.py').read(), {'net': net, '__builtins__': __builtins__})
-
-  STEP 5 — ANALYSE  (after a run):
-    python3 /home/ayush/my2/analyze_evals.py
-
-  See RUNBOOK.md for the full workflow.
-================================================================\033[0m
-""")
-
+net.disableCli()                                       # start CLI ourselves, after host config
 net.startNetwork()
+mn = net.net
+
+for h in ft.HOSTS:                                     # enable IPv6 + assign own address
+    n, ifc = mn.get(h['name']), f"{h['name']}-eth0"
+    n.cmd('sysctl -w net.ipv6.conf.all.disable_ipv6=0 >/dev/null 2>&1')
+    n.cmd(f'ip -6 addr add nodad {h["ipv6"]}/64 dev {ifc} 2>/dev/null')
+for h in ft.HOSTS:                                     # static NDP for every other host
+    n, ifc = mn.get(h['name']), f"{h['name']}-eth0"
+    for o in ft.HOSTS:
+        if o['name'] != h['name']:
+            n.cmd(f'ip -6 neigh replace {o["ipv6"]} lladdr {o["mac"]} dev {ifc} nud permanent')
+
+TMP = os.path.join(HERE, 'tmp'); os.makedirs(TMP, exist_ok=True)   # run artifacts (gitignored)
+for srv in ft.SERVERS:                                 # auto-start nginx+pcap on every server
+    mn.get(srv).cmd(f'python3 {HERE}/server.py > {TMP}/srv_{srv}.log 2>&1 &')
+print(f"[net] {len(ft.HOSTS)} hosts configured; servers running: {ft.SERVERS}")
+
+print("\n\033[1;36m CLOS fat-tree up (20 switches, 32 hosts, 8 servers h4..h32)."
+      "\n  controller : python3 controller.py"
+      "\n  traffic    : py exec(open('launch.py').read())"
+      "\n  watch a srv: xterm h8  ->  tail -f tmp/srv_h8.log\033[0m\n")
+CLI(mn); net.stopNetwork()

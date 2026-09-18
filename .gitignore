@@ -2,3 +2,14 @@
 *.txt
 .DS_Store
 __pycache__/
+
+# run artifacts (regenerated each run)
+tmp/
+topology.json
+p4src/*.json
+p4src/*.p4i
+
+# kept locally but not uploaded (per request)
+CLOS/
+geant/
+TODO.md
