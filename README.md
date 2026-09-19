@@ -7,7 +7,9 @@ switches **flowlet-spray** across their uplinks, so a connection's SYN and its A
 switches — while packets within a burst keep one path so TCP stays in order.
 Each aggregation switch runs a lightweight Count-Min-Sketch detector; a central
 controller reconstructs each flow across detectors, scores it, and blocks
-attackers fabric-wide.
+attackers fabric-wide. **Spoofed floods** — a forged source IP on every packet, which
+the per-flow counter can't see — are caught by a separate per-destination
+**source-cardinality** check that names the targeted server.
 
 <p align="center">
   <img src="fattree_topology.svg" alt="k=4 fat-tree topology" width="100%">
@@ -55,6 +57,29 @@ it decides.
    window never blocks, but a real attacker (every window bad) is blocked after a
    couple of windows, on **every** detector at once.
 
+## Spoofing detection (forged-source floods)
+
+A spoofed flood puts a **different random source IP on every packet**, so each forged
+connection is its own flow key with ~1 SYN — it never reaches the 32-SYN threshold, and
+blocking the (forged, unbounded, IPv6) sources is hopeless. The controller catches it
+with a separate, orthogonal signal:
+
+- It keeps a **live set per server** of *uncompleted* source IPs — a source is added on
+  its first SYN and **removed when its handshake completes** (a returning ACK). Because
+  the flow key ignores the source port, a real client counts as **one** source no matter
+  how many connections it opens, so a benign server sits at a handful of sources while a
+  **spoofed victim accumulates thousands** of never-completing forged sources.
+- A server is flagged when its uncompleted-source **count crosses `card_thresh`** (50 on
+  this testbed). **That count is the decision.**
+- **Tsallis entropy** over the destination distribution is also computed and reported —
+  but is *not* the trigger: it's blind to spread/multi-victim spoofing (entropy stays
+  high), so cardinality does the work. Entropy is kept as the standard comparison metric.
+
+Detection is **topology-robust**: completions are signalled on both asymmetric paths (ACK
+at a switch that never saw the SYN) and symmetric paths (a once-per-flow flag packed into
+the CMS cell). It is **detection-only** for now — forged sources can't be blocked, so the
+response is victim-side rate-limiting (future work).
+
 ## Validated results (k=4 fat-tree, 24 clients → 8 servers)
 
 | Scenario | Traffic | Result |
@@ -64,6 +89,8 @@ it decides.
 | `flash`  | 24 clients, `ab -c 40 -n 200` | 24/24 served, **0 FP** |
 | `mixed`  | 12 attack + 12 benign | 12/12 blocked, 12/12 served, **0 FP** |
 | `lrddos` | 24 clients, 1…100 pps ladder | detected down to the lowest rate |
+| `spoof`  | K∈[3,8] random victims spoofed + benign on the rest | **100% victims detected, 0 false alarms** (server-level) |
+| `spoof-sweep` | laddered forged-source counts per server | finds the detection **floor** (= `card_thresh`) |
 
 **Recall 100%, FPR 0%.** The edge uses **flowlet spray**, so a heavy legit burst
 keeps TCP in order and completes. At block-score `-2`, the flash 0-FP result holds
@@ -80,7 +107,7 @@ my2/
 ├── network.py            boot fabric, auto-config hosts (IPv6+NDP), start 8 servers
 ├── controller.py         forwarding on all 20 + detection on the 8 aggregations
 ├── server.py             per-server nginx + pcap (auto-started by network.py)
-├── launch.py             traffic from all clients: benign/flash/attack/mixed/lrddos
+├── launch.py             traffic modes: benign/flash/attack/mixed/lrddos/spoof/spoof-sweep
 ├── models/               lean_model.pkl, lean_feature_order.pkl
 ├── p4src/                ft_core.p4, ft_edge.p4, ddos_detector.p4
 ├── lib/                  fattree.py (topology) · attack.py · verify.py · nginx_ft.conf
@@ -112,6 +139,10 @@ See **RUNBOOK.md** for the full walkthrough (live server logs, resets, caveats).
 
 A stealth flood that completes ≥10% of its handshakes evades a completion-ratio
 detector by design — its ratio overlaps the RTT-lagged benign region, so no
-threshold separates them without new false positives. Catching it needs an
-orthogonal signal (short-window SYN volume / destination entropy), left as
-future work.
+threshold separates them without new false positives. Closing it is the current
+next step: retrain the model on partial-completion samples plus SYN-volume features.
+
+Spoofing detection is **detection-only** — it names the victim but does not mitigate.
+The correct response (forged sources can't be blocked) is victim-side rate-limiting +
+SYN cookies + an RST-innocence whitelist, and the `card_thresh` floor should become an
+**adaptive, baseline-relative** threshold for real-world (non-testbed) traffic.
