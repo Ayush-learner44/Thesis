@@ -6,7 +6,7 @@ lean model, and blocks a source (on every detector) once its reputation score
 hits BLOCK_SCORE. Self-contained: the detection classes are here, not imported.
 Run:  python3 controller.py
 """
-import os, sys, time, pickle, threading, logging, ipaddress, subprocess
+import os, sys, time, math, pickle, threading, logging, ipaddress, subprocess, collections
 import numpy as np
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, 'lib'))
@@ -32,6 +32,7 @@ REWARD, PENALTY, CAP, BLOCK_SCORE = 1, 1, 3, -2
 
 def role(sw): return 'core' if sw in ft.CORES else ('agg' if sw in ft.AGGS else 'edge')
 def _ip6(raw): return str(ipaddress.ip_address(bytes(raw)))
+IP2NAME = {h['ipv6']: h['name'] for h in ft.HOSTS}          # readable spoof-victim names
 
 
 class LeanModel:
@@ -60,31 +61,105 @@ class Reporter:
               f"score={score} -> dropped on all detectors", flush=True)
     def mark(self, text):
         print(f"{self._stamp()} {self._C['mark']}── {text} ──{self._C['z']}", flush=True)
+    def entropy(self, H, victim, vsyn, total, vsrc, suspect=False):
+        share = vsyn / total if total else 0.0
+        tag = f"  {self._C['BLOCK']}<< SPOOF SUSPECTED >>{self._C['z']}" if suspect else ""
+        print(f"{self._stamp()} {self._C['mark']}ENTROPY H={H:.2f}  top={victim} "
+              f"({vsyn}/{total} uncompleted, {share:.0%})  distinct_srcs={vsrc}{self._C['z']}{tag}", flush=True)
+
+
+class EntropyMonitor:
+    """Completion-gated traffic-entropy over destinations (report-only for now).
+    LIVE set { dst : uncompleted source IPs }: a source is ADDED on FIRST_SEEN and
+    REMOVED on EVIDENCE (its flow completed, sym or asym path). Every `window` s it
+    snapshots (does NOT clear) and computes Tsallis entropy over the per-dst
+    uncompleted-source counts. Entropy DROPS when uncompleted flows pile onto one
+    victim = the spoofing signature: spoofed sources never complete so they persist,
+    while benign sources are removed within ~1 RTT. Not wired into blocking yet."""
+    def __init__(self, reporter, tmp=None, window=2.0, q=2.0, card_thresh=50):
+        self.rep, self.win, self.q, self.tmp = reporter, window, q, tmp
+        self.card_thresh = card_thresh                         # min uncompleted srcs to call it spoofing
+        self.lock = threading.Lock()
+        self.srcs = collections.defaultdict(set)               # dst -> {uncompleted src}
+        self.suspects = {}                                     # victim_ip -> peak uncompleted-src count
+        self._last = None                                      # last reported snapshot (dedup)
+        self.min_H, self.max_H = float('inf'), 0.0             # entropy range over the run
+    def arrived(self, src, dst):                               # FIRST_SEEN: new flow
+        with self.lock: self.srcs[dst].add(src)
+    def completed(self, src, dst):                             # EVIDENCE: flow finished -> drop
+        with self.lock:
+            s = self.srcs.get(dst)
+            if s is not None: s.discard(src)
+    def _tsallis(self, counts):
+        tot = sum(counts)
+        if tot <= 0: return 0.0
+        ps = [c / tot for c in counts]
+        if self.q == 1.0:                                      # Shannon limit
+            return -sum(p * math.log2(p) for p in ps if p > 0)
+        return (1.0 - sum(p ** self.q for p in ps)) / (self.q - 1.0)
+    def _flush(self):
+        with self.lock:
+            counts = {d: len(v) for d, v in self.srcs.items() if v}   # snapshot, DON'T clear
+        if not counts: return
+        sig = tuple(sorted(counts.items()))
+        if sig == self._last: return                           # unchanged since last window -> don't repeat
+        self._last = sig
+        H = self._tsallis(list(counts.values()))
+        self.min_H = min(self.min_H, H); self.max_H = max(self.max_H, H)
+        victim = max(counts, key=counts.get)
+        top = counts[victim]
+        flagged = False
+        for d, n in counts.items():                            # flag EVERY dest over threshold
+            if n >= self.card_thresh:
+                self.suspects[d] = max(self.suspects.get(d, 0), n); flagged = True
+        self.rep.entropy(H, victim, top, sum(counts.values()), top, flagged)
+        if self.tmp: self.dump(self.tmp)                       # keep verify.py's files fresh (every change)
+    def run(self):                                             # daemon loop
+        while True:
+            time.sleep(self.win)
+            self._flush()
+    def dump(self, tmp):                                       # write detection + entropy for verify.py
+        with self.lock:
+            sus = dict(self.suspects); mn, mx = self.min_H, self.max_H
+        with open(os.path.join(tmp, 'spoof_detected.csv'), 'w') as f:
+            f.write('server_ip,peak_uncompleted\n')
+            for ip, c in sorted(sus.items(), key=lambda kv: -kv[1]):
+                f.write(f'{ip},{c}\n')
+        with open(os.path.join(tmp, 'spoof_summary.txt'), 'w') as f:
+            f.write((f'{mn:.4f} {mx:.4f}\n') if mn != float('inf') else 'nan nan\n')
+    def reset(self):                                          # clear per-run spoof state on new traffic
+        with self.lock:
+            self.srcs.clear(); self.suspects.clear()
+            self.min_H, self.max_H, self._last = float('inf'), 0.0, None
+        if self.tmp: self.dump(self.tmp)
 
 
 class FlowTable:
-    """Per-flow state: [first_seen, ack_count, last_eval, last_cms_syn, score]."""
+    """Per-flow state: [first_seen, ack_count, last_eval, score].
+    SYN counting is windowed IN THE DATA PLANE now (each THRESHOLD digest = one
+    32-SYN window, counter resets at 32), so the controller no longer tracks a
+    cms delta."""
     def __init__(self, cap=100_000):
         self.t, self.lock, self.cap = {}, threading.Lock(), cap
     def record(self, fk, ts):                                   # note a new flow once; True if new
         with self.lock:
             if fk in self.t: return False
             if len(self.t) >= self.cap: del self.t[next(iter(self.t))]
-            self.t[fk] = [ts, 0, ts, 0, 0]
+            self.t[fk] = [ts, 0, ts, 0]
             return True
     def add_ack(self, fk):                                      # EVIDENCE -> +1 windowed ack
         with self.lock:
             if fk in self.t: self.t[fk][1] += 1
     def bump(self, fk, d):                                      # move reputation score (capped)
         with self.lock:
-            e = self.t.setdefault(fk, [0, 0, 0, 0, 0])
-            e[4] = min(CAP, e[4] + d); return e[4]
-    def snap(self, fk, cms, ts):                               # read window + reset, atomically
+            e = self.t.setdefault(fk, [0, 0, 0, 0])
+            e[3] = min(CAP, e[3] + d); return e[3]
+    def snap(self, fk, ts):                                     # read ACK window + reset, atomically
         with self.lock:
-            e = self.t.setdefault(fk, [ts, 0, ts, 0, 0])
-            fs, ack, start, last = e[0], e[1], e[2], e[3]
-            e[1], e[2], e[3] = 0, ts, cms
-            return fs, last, ack, start
+            e = self.t.setdefault(fk, [ts, 0, ts, 0])
+            fs, ack, start = e[0], e[1], e[2]
+            e[1], e[2] = 0, ts
+            return fs, ack, start
 
 
 class Controller:
@@ -92,6 +167,7 @@ class Controller:
         self.model = LeanModel(MODELS_DIR)
         self.flows = FlowTable()
         self.report = Reporter()
+        self.entropy = EntropyMonitor(self.report, tmp=os.path.join(HERE, 'tmp'))  # 2s spoof entropy
         self._last_evt = 0.0                                    # ts of last digest (activity monitor)
         self.sw = {}
         self.blocked = set()
@@ -155,13 +231,18 @@ class Controller:
     def _first_seen(self, m, s):
         fk = (_ip6(m[0].bitstring), _ip6(m[1].bitstring),
               int.from_bytes(m[2].bitstring, 'big'), int.from_bytes(m[3].bitstring, 'big'))
-        if self.flows.record(fk, int.from_bytes(m[4].bitstring, 'big')):
-            self.report.seen(fk[0], fk[2])                      # print once per new flow
-        with self.lock: self.stats['first_seen'] += 1
+        if self.flows.record(fk, int.from_bytes(m[4].bitstring, 'big')):   # genuinely NEW flow only
+            self.report.seen(fk[0], fk[2])                      # print once
+            self.entropy.arrived(fk[0], fk[1])                 # add src to the dst's uncompleted set
+            with self.lock: self.stats['first_seen'] += 1
+        # a re-fired FIRST_SEEN for an already-known flow (post-reset) does nothing:
+        # no print, no stat, no entropy double-count.
 
     def _evidence(self, m, s):
-        self.flows.add_ack((_ip6(m[0].bitstring), _ip6(m[1].bitstring),
-                            int.from_bytes(m[2].bitstring, 'big'), int.from_bytes(m[3].bitstring, 'big')))
+        src, dst = _ip6(m[0].bitstring), _ip6(m[1].bitstring)
+        fk = (src, dst, int.from_bytes(m[2].bitstring, 'big'), int.from_bytes(m[3].bitstring, 'big'))
+        self.flows.add_ack(fk)
+        self.entropy.completed(src, dst)                       # flow completed -> drop from spoof set
         with self.lock: self.stats['evidence'] += 1
 
     def _threshold(self, m, s):
@@ -172,8 +253,8 @@ class Controller:
         with self.lock:
             self.stats['threshold'] += 1
             if src in self.blocked: return
-        _, last, ack, start = self.flows.snap(fk, cms, ts)
-        syn = cms - last if cms - last > 0 else cms                 # windowed SYNs (~32)
+        _, ack, start = self.flows.snap(fk, ts)
+        syn = cms if cms > 0 else 32                                # data plane windows SYNs: 1 digest = 32
         unacked = max(0, syn - ack)
         compl = ack / syn if syn else 0.0
         elapsed = max(0.001, (ts - start) / 1e6)
@@ -225,19 +306,26 @@ class Controller:
         for s in ft.AGGS:
             threading.Thread(target=self._recv, args=(s,), daemon=True).start()
         threading.Thread(target=self._monitor, daemon=True).start()
+        threading.Thread(target=self.entropy.run, daemon=True).start()   # 2s entropy report
         log.info(f"CLOS controller RUNNING  detectors={ft.AGGS}")
         self.report.mark('controller RUNNING — waiting for traffic')
+        def _spoof():                                          # readable spoof-suspect summary (most-hit first)
+            sp = sorted(self.entropy.suspects.items(), key=lambda kv: -kv[1])
+            return (', '.join(f"{IP2NAME.get(ip, ip)}({c})" for ip, c in sp) if sp else 'none')
         try:
             while True:
                 time.sleep(10)
                 with self.lock: s = dict(self.stats)
                 log.info(f"STATS | FirstSeen:{s['first_seen']} Threshold:{s['threshold']} "
                          f"Evidence:{s['evidence']} Benign:{s['benign']} "
-                         f"Suspicious:{s['suspicious']} Blocked:{s['blocked']}")
+                         f"Suspicious:{s['suspicious']} Blocked:{s['blocked']} "
+                         f"| Spoof-suspect: {_spoof()}")
         except KeyboardInterrupt:
             with self.lock: s = dict(self.stats)
+            self.entropy.dump(os.path.join(HERE, 'tmp'))
             print(f"\nFINAL | Threshold:{s['threshold']} Benign:{s['benign']} "
-                  f"Suspicious:{s['suspicious']} Blocked:{s['blocked']}")
+                  f"Suspicious:{s['suspicious']} Blocked:{s['blocked']} "
+                  f"| Spoof-suspect: {_spoof()}")
 
 
 if __name__ == '__main__':

@@ -9,7 +9,7 @@ const bit<16> ETHERTYPE_IPV6 = 0x86DD;
 const bit<8>  PROTO_TCP      = 6;
 const bit<9>  TCP_SYN        = 9w0x002;
 const bit<9>  TCP_ACK        = 9w0x010;
-const bit<32> CMS_COLUMNS    = 1024;
+const bit<32> CMS_COLUMNS    = 2048;
 
 // ================================================================
 // HEADERS
@@ -130,9 +130,11 @@ control MyIngress(inout headers_t hdr,
                   inout metadata_t meta,
                   inout standard_metadata_t standard_metadata) {
 
-    // Count-Min Sketch: 2 rows x 1024 columns, 32-bit counters
-    register<bit<32>>(CMS_COLUMNS) cms_row0;   // indexed by CRC16
-    register<bit<32>>(CMS_COLUMNS) cms_row1;   // indexed by CRC32
+    // Count-Min Sketch: 2 rows x CMS_COLUMNS. Each 7-bit cell = [ flag:1 (MSB) | count:6 ].
+    // count resets to 0 at THRESHOLD (never exceeds 32); flag = "completion already
+    // signalled for this bucket" (set on the first completing ACK, cleared when count->0).
+    register<bit<7>>(CMS_COLUMNS) cms_row0;    // packed [flag|count] (SRAM, not TCAM)
+    register<bit<7>>(CMS_COLUMNS) cms_row1;
 
     action drop() {
         mark_to_drop(standard_metadata);
@@ -186,15 +188,16 @@ control MyIngress(inout headers_t hdr,
                    hdr.ipv6.nextHdr },
                  CMS_COLUMNS);
 
-            bit<32> c0;
-            bit<32> c1;
+            bit<7> cell0; bit<7> cell1;        // packed [ flag:1 | count:6 ]
+            bit<6> c0;    bit<6> c1;           // count portion
+            bit<1> f0;    bit<1> f1;           // completion-notified flag
 
             // Step 5a: pure SYN (SYN=1, ACK=0) — increment CMS
             if ((hdr.tcp.flags & TCP_SYN) != 0 &&
                 (hdr.tcp.flags & TCP_ACK) == 0) {
 
-                cms_row0.read(c0, idx0);
-                cms_row1.read(c1, idx1);
+                cms_row0.read(cell0, idx0); c0 = cell0[5:0]; f0 = cell0[6:6];
+                cms_row1.read(cell1, idx1); c1 = cell1[5:0]; f1 = cell1[6:6];
 
                 // FIRST_SEEN: at least one CMS slot is zero → new flow
                 if (c0 == 0 || c1 == 0) {
@@ -209,56 +212,66 @@ control MyIngress(inout headers_t hdr,
 
                 c0 = c0 + 1;
                 c1 = c1 + 1;
-                cms_row0.write(idx0, c0);
-                cms_row1.write(idx1, c1);
 
-                // Step 6: cms_min = min of the two post-increment counts
-                bit<32> cms_min;
-                if (c0 < c1) {
-                    cms_min = c0;
-                } else {
-                    cms_min = c1;
-                }
+                // cms_min = min of the two post-increment counts
+                bit<6> cms_min;
+                if (c0 < c1) { cms_min = c0; } else { cms_min = c1; }
 
-                // Step 7: fire THRESHOLD digest every 32 SYNs
-                // bitmask & 0x1F == 0 iff cms_min is an exact multiple of 32
-                // (lowered from 0x3F/64 to compensate for ECMP SYN-split dilution
-                //  at 60-host scale — see test.txt section 12 for the math)
-                if ((cms_min & 0x1F) == 0 && cms_min > 0) {
+                // reset-on-threshold: at 32 SYNs fire ONE digest and zero the cell
+                // (clears flag+count). count is 6-bit, never exceeds 32 -> no overflow.
+                if (cms_min >= 32) {
                     digest<threshold_digest_t>(1, {
                         hdr.ipv6.srcAddr,
                         hdr.ipv6.dstAddr,
                         hdr.tcp.dstPort,
                         hdr.ipv6.nextHdr,
-                        cms_min,
+                        (bit<32>)cms_min,
                         standard_metadata.ingress_global_timestamp
                     });
+                    cms_row0.write(idx0, 0);
+                    cms_row1.write(idx1, 0);
+                } else {
+                    cms_row0.write(idx0, f0 ++ c0);   // preserve flag, store count
+                    cms_row1.write(idx1, f1 ++ c1);
                 }
 
-            // Step 5b: pure ACK only (ACK=1, SYN=0) — decrement CMS, floor at 0
-            // SYN-ACK is excluded: it would hash to server's direction (different bucket)
-            // but SYN-ACK retransmits from h0 can randomly collide with attacker buckets,
-            // causing the counter to drift down and delaying detection significantly.
+            // Step 5b: pure ACK only (ACK=1, SYN=0)
             } else if ((hdr.tcp.flags & TCP_ACK) != 0 &&
                        (hdr.tcp.flags & TCP_SYN) == 0) {
 
-                cms_row0.read(c0, idx0);
-                cms_row1.read(c1, idx1);
+                cms_row0.read(cell0, idx0); c0 = cell0[5:0]; f0 = cell0[6:6];
+                cms_row1.read(cell1, idx1); c1 = cell1[5:0]; f1 = cell1[6:6];
 
-                // EVIDENCE: at least one CMS row is zero — this switch never saw
-                // the SYN for this flow, so it arrived via the other path.
-                // OR condition: one collision-free row is enough to confirm asymmetry.
                 if (c0 == 0 || c1 == 0) {
+                    // ASYMMETRIC: ACK at a switch that never saw the SYN. Per-ACK
+                    // evidence (controller counts the ack + drops src from spoof set).
                     digest<evidence_digest_t>(1, {
                         hdr.ipv6.srcAddr,
                         hdr.ipv6.dstAddr,
                         hdr.tcp.dstPort,
                         hdr.ipv6.nextHdr
                     });
+                } else {
+                    // SYMMETRIC: this switch saw the SYN. Fire completion ONCE per flow
+                    // via the flag (two-row: fire unless BOTH rows already notified).
+                    if (f0 == 0 || f1 == 0) {
+                        digest<evidence_digest_t>(1, {
+                            hdr.ipv6.srcAddr,
+                            hdr.ipv6.dstAddr,
+                            hdr.tcp.dstPort,
+                            hdr.ipv6.nextHdr
+                        });
+                        f0 = 1; f1 = 1;
+                    }
                 }
 
-                if (c0 > 0) { cms_row0.write(idx0, c0 - 1); }
-                if (c1 > 0) { cms_row1.write(idx1, c1 - 1); }
+                // decrement (floor 0); clear the flag once a bucket empties
+                if (c0 > 0) { c0 = c0 - 1; }
+                if (c1 > 0) { c1 = c1 - 1; }
+                if (c0 == 0) { f0 = 0; }
+                if (c1 == 0) { f1 = 0; }
+                cms_row0.write(idx0, f0 ++ c0);
+                cms_row1.write(idx1, f1 ++ c1);
             }
         }
 
